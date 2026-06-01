@@ -1,7 +1,9 @@
+import dataclasses
 import gettext
 import os
 import subprocess
 import threading
+import time
 
 import gi
 
@@ -51,13 +53,13 @@ _REFRESH_DEBOUNCE_MS  = 300  # coalesce rapid mount/unmount/plug events
 _WIN_INIT_RETRY_MS    = 20   # retry interval while waiting for NautilusWindow widget tree
 _NAV_RETRY_MS         = 60   # retry interval while navigating to computer:///
 _TAB_WAIT_MS          = 50   # retry interval while waiting for a new tab slot
+_USAGE_GATE_MS        = 1000  # local worker cadence: try a statvfs sweep this often, but skip while the disk is busy
+_USAGE_BUSY_RATIO     = 0.50  # io_ticks delta / interval above this == disk busy → skip statvfs (avoid I/O contention)
+_USAGE_POLL_NETWORK_MS = 5000  # statvfs poll interval for network/GVfs mounts (can block)
 _SORT_POLL_MS         = 250  # gvfs sort-metadata poll cadence (only while header is hovered)
-
 
 _FLOW_COLS_GRID      = 8     # max columns in grid (FlowBox) view
 _LIST_MAX_WIDTH      = 450   # max width (px) of a card group in list view
-
-
 
 
 # Resolve the display name Nautilus shows in the title bar when at DISKS_URI,
@@ -99,32 +101,87 @@ NETWORK_FSTYPES = {
 EXTERNAL_PREFIXES = ("/media/", "/run/media/", "/mnt/")
 
 
-def _classify_mount(m: dict) -> str:
-    """Return 'system', 'external', or 'network' for a mount entry."""
+@dataclasses.dataclass
+class MountInfo:
+    """Typed representation of a single mounted/unmounted storage entry."""
+    # Stable identity
+    key: str            # "uuid:<uuid>" when UUID is known; otherwise device path or URI
+    uuid: str | None    # filesystem UUID from /dev/disk/by-uuid (None for GVfs/unmounted)
+
+    # Device info
+    device: str         # /dev/sda1 or GVfs URI
+    mountpoint: str     # local path or GVfs URI (empty for unmounted)
+    fstype: str         # "ext4", "gvfs", "unmounted", "network-place", …
+    opts: set           # mount options from /proc/mounts
+
+    # Navigation
+    nav_uri: str        # file:///… or smb://… (empty for unmounted)
+    display_name: str   # user-facing label
+
+    # Usage (updated by poll workers via dataclasses.replace)
+    total: int
+    free: int
+
+    # GIO handles
+    gio_icon: object | None = None
+    gio_mount: object | None = None
+    gio_volume: object | None = None
+
+    # Flags
+    is_gio: bool = False
+    is_unmounted: bool = False
+    is_removable: bool = False
+    can_eject: bool = False
+    is_network_place: bool = False
+
+    @property
+    def used(self) -> int:
+        return self.total - self.free
+
+    @property
+    def percent(self) -> float:
+        return round(self.used / self.total * 100, 1) if self.total > 0 else 0.0
+
+
+def _build_uuid_map() -> dict[str, str]:
+    """Return {real_device_path: uuid_string} from /dev/disk/by-uuid."""
+    result: dict[str, str] = {}
+    by_uuid = "/dev/disk/by-uuid"
+    if not os.path.isdir(by_uuid):
+        return result
+    try:
+        for entry in os.scandir(by_uuid):
+            if entry.is_symlink():
+                try:
+                    result[os.path.realpath(entry.path)] = entry.name
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return result
+
+
+def _classify_mount(m: MountInfo) -> str:
+    """Return 'system', 'external', 'removable', or 'network' for a mount entry."""
     # Unmounted volumes are never part of the running system.
     # Removable (USB, optical) → "Removable Devices"; others → "Devices and Drives"
-    if m.get("is_unmounted"):
-        return "removable" if m.get("is_removable") else "external"
+    if m.is_unmounted:
+        return "removable" if m.is_removable else "external"
 
     # GVfs mounts — phones/cameras (MTP, PTP) go to removable; rest are network
-    if m.get("is_gio"):
-        uri = m.get("nav_uri", "")
-        if uri.startswith(("mtp://", "gphoto2://", "afc://", "obex://")):
+    if m.is_gio:
+        if m.nav_uri.startswith(("mtp://", "gphoto2://", "afc://", "obex://")):
             return "removable"
         return "network"
-
-    fstype = m.get("fstype", "")
-    mountpoint = m.get("mountpoint", "")
-    opts = m.get("opts", set())
 
     # Removable-media paths always → check removable flag first, then external.
     # This ensures NTFS/fuseblk drives at /run/media/ are not misclassified
     # as network just because their fstype starts with "fuse".
-    if any(mountpoint.startswith(p) for p in EXTERNAL_PREFIXES):
-        return "removable" if m.get("is_removable") else "external"
+    if any(m.mountpoint.startswith(p) for p in EXTERNAL_PREFIXES):
+        return "removable" if m.is_removable else "external"
 
     # x-gvfs-show fstab entries and known network fstypes → network
-    if "x-gvfs-show" in opts or fstype in NETWORK_FSTYPES or fstype.startswith("fuse"):
+    if "x-gvfs-show" in m.opts or m.fstype in NETWORK_FSTYPES or m.fstype.startswith("fuse"):
         return "network"
 
     return "system"
@@ -146,9 +203,8 @@ _GROUPS: list[tuple[str, str]] = [
     ("network",   "Network Volumes"),
 ]
 
-_disk_data: dict[str, dict] = {}
-_network_places: list[dict] = []  # populated async from network:///
-
+_disk_data: dict[str, MountInfo] = {}
+_network_places: list[MountInfo] = []  # populated async from network:///
 
 
 _CSS = b"""
@@ -179,6 +235,40 @@ def _log(msg: str) -> None:
         print(f"{DEBUG_LOG_PREFIX}: {msg}", flush=True)
 
 
+def _read_io_busy() -> tuple:
+    """Return (io_ticks_ms, ios_in_progress) summed over physical block devices.
+
+    Reads /proc/diskstats — a pure procfs read with no filesystem/journal
+    involvement, so unlike statvfs it never blocks or contends with an in-flight
+    file operation. Used purely as a disk-busy gate: while the disk has I/O in
+    flight we must NOT call statvfs (statvfs blocks for seconds under ext4 journal
+    load and contends with the very operation in progress — confirmed cause of
+    sluggish copy/delete when the panel was visible). io_ticks counts wall-time the
+    device had at least one request in flight; its delta over an interval gives the
+    busy fraction. ios_in_progress is the instantaneous queue depth.
+
+    Note: this is NOT the previously-removed diskstats *estimation* approach — we
+    never derive free space from it, only gate when it is safe to call statvfs."""
+    ticks = inflight = 0
+    try:
+        with open("/proc/diskstats") as f:
+            for line in f:
+                p = line.split()
+                if len(p) < 14:
+                    continue
+                name = p[2]
+                if name.startswith(("loop", "ram", "zram", "dm-", "sr")):
+                    continue
+                try:
+                    inflight += int(p[11])  # field 12: I/Os currently in progress
+                    ticks += int(p[12])     # field 13: ms spent doing I/Os (io_ticks)
+                except ValueError:
+                    continue
+    except OSError:
+        pass
+    return ticks, inflight
+
+
 _log(f"Configured URI title: '{_LOCATION_TITLE}' (Bookmark: '{BOOKMARK_LABEL}')")
 
 
@@ -191,14 +281,17 @@ def _get_gsettings() -> Gio.Settings | None:
 
 def _format_size(n: float) -> str:
     for unit in ("B", "KB", "MB", "GB", "TB", "PB"):
-        if n < 1024:
+        if n < 1000:
             return f"{n:.1f} {unit}"
-        n /= 1024
+        n /= 1000
     return f"{n:.1f} EB"
 
 
-def _scan_mounts() -> list[dict]:
-    mounts, seen = [], set()
+
+def _scan_mounts() -> list[MountInfo]:
+    mounts: list[MountInfo] = []
+    seen: set[str] = set()
+    uuid_map = _build_uuid_map()
 
     # Build mountpoint → Gio.Icon / Gio.Mount from VolumeMonitor so we can
     # attach the real hardware icon and GIO handle to each /proc/mounts entry.
@@ -232,33 +325,34 @@ def _scan_mounts() -> list[dict]:
                     st = os.statvfs(mountpoint)
                     total = st.f_blocks * st.f_frsize
                     free = st.f_bavail * st.f_frsize
-                    used = total - free
                     name = os.path.basename(mountpoint) or "/"
                     gio_mount = mount_by_path.get(mountpoint)
                     gio_volume = gio_mount.get_volume() if gio_mount else None
                     gio_drive = gio_volume.get_drive() if gio_volume else None
-                    mounts.append({
-                        "device": device,
-                        "short": device.split("/")[-1],
-                        "mountpoint": mountpoint,
-                        "fstype": fstype,
-                        "opts": opts,
-                        "total": total,
-                        "used": used,
-                        "free": free,
-                        "percent": round(used / total * 100, 1) if total > 0 else 0.0,
-                        "display_name": name,
-                        "nav_uri": Gio.File.new_for_path(mountpoint).get_uri(),
-                        "gio_icon": icon_by_path.get(mountpoint),
-                        "gio_mount": gio_mount,
-                        "gio_volume": gio_volume,
-                        "is_removable": gio_drive.is_removable() if gio_drive else False,
-                        "can_eject": bool(
+                    real_dev = os.path.realpath(device)
+                    uuid = uuid_map.get(real_dev)
+                    key = f"uuid:{uuid}" if uuid else device
+                    mounts.append(MountInfo(
+                        key=key,
+                        uuid=uuid,
+                        device=device,
+                        mountpoint=mountpoint,
+                        fstype=fstype,
+                        opts=opts,
+                        total=total,
+                        free=free,
+                        display_name=name,
+                        nav_uri=Gio.File.new_for_path(mountpoint).get_uri(),
+                        gio_icon=icon_by_path.get(mountpoint),
+                        gio_mount=gio_mount,
+                        gio_volume=gio_volume,
+                        is_removable=gio_drive.is_removable() if gio_drive else False,
+                        can_eject=bool(
                             (gio_volume and gio_volume.can_eject()) or
                             (gio_mount and gio_mount.can_eject()) or
                             (gio_drive and gio_drive.can_eject())
                         ),
-                    })
+                    ))
                 except OSError:
                     pass
     except OSError:
@@ -266,13 +360,13 @@ def _scan_mounts() -> list[dict]:
     return mounts
 
 
-def _scan_gio_mounts() -> list[dict]:
+def _scan_gio_mounts() -> list[MountInfo]:
     """Enumerate GVfs/network mounts via Gio.VolumeMonitor.
 
     Returns mounts that are NOT file:// (those are already covered by
     _scan_mounts via /proc/mounts), e.g. smb://, sftp://, mtp://, dav://.
     """
-    results = []
+    results: list[MountInfo] = []
     try:
         vm = Gio.VolumeMonitor.get()
         for mount in vm.get_mounts():
@@ -289,55 +383,51 @@ def _scan_gio_mounts() -> list[dict]:
             name = mount.get_name() or uri
             local_path = root.get_path()  # FUSE path, may be None
 
-            total = used = free = 0
-            percent = 0.0
+            total = free = 0
             if local_path:
                 try:
                     st = os.statvfs(local_path)
                     total = st.f_blocks * st.f_frsize
                     free = st.f_bavail * st.f_frsize
-                    used = total - free
-                    percent = round(used / total * 100, 1) if total > 0 else 0.0
                 except OSError:
                     pass
 
             gio_volume = mount.get_volume()
             gio_drive = gio_volume.get_drive() if gio_volume else None
-            results.append({
-                "device": uri,
-                "short": f"gio:{name}",
-                "mountpoint": local_path or uri,
-                "fstype": "gvfs",
-                "opts": set(),
-                "total": total,
-                "used": used,
-                "free": free,
-                "percent": percent,
-                "display_name": name,
-                "nav_uri": uri,
-                "is_gio": True,
-                "gio_icon": mount.get_icon(),
-                "gio_mount": mount,
-                "gio_volume": gio_volume,
-                "is_removable": gio_drive.is_removable() if gio_drive else False,
-                "can_eject": bool(
+            results.append(MountInfo(
+                key=uri,
+                uuid=None,
+                device=uri,
+                mountpoint=local_path or uri,
+                fstype="gvfs",
+                opts=set(),
+                total=total,
+                free=free,
+                display_name=name,
+                nav_uri=uri,
+                is_gio=True,
+                gio_icon=mount.get_icon(),
+                gio_mount=mount,
+                gio_volume=gio_volume,
+                is_removable=gio_drive.is_removable() if gio_drive else False,
+                can_eject=bool(
                     (gio_volume and gio_volume.can_eject()) or
                     mount.can_eject() or
                     (gio_drive and gio_drive.can_eject())
                 ),
-            })
+            ))
     except Exception:
         pass
     return results
 
 
-def _scan_gio_volumes() -> list[dict]:
+def _scan_gio_volumes() -> list[MountInfo]:
     """Enumerate Gio volumes that are connected but not yet mounted.
 
     Volumes already mounted are covered by _scan_mounts / _scan_gio_mounts,
     so we skip them here to avoid duplicates.
     """
-    results = []
+    results: list[MountInfo] = []
     try:
         vm = Gio.VolumeMonitor.get()
         for volume in vm.get_volumes():
@@ -346,24 +436,23 @@ def _scan_gio_volumes() -> list[dict]:
             name = volume.get_name() or "Unknown Device"
             drive = volume.get_drive()
             is_removable = drive.is_removable() if drive else True
-            results.append({
-                "device": f"vol:{name}",
-                "short": f"vol:{name}",
-                "mountpoint": "",
-                "fstype": "unmounted",
-                "opts": set(),
-                "total": 0,
-                "used": 0,
-                "free": 0,
-                "percent": 0.0,
-                "display_name": name,
-                "nav_uri": "",
-                "is_unmounted": True,
-                "is_removable": is_removable,
-                "gio_icon": volume.get_icon(),
-                "gio_volume": volume,
-                "can_eject": volume.can_eject() or (drive and drive.can_eject()),
-            })
+            results.append(MountInfo(
+                key=f"vol:{name}",
+                uuid=None,
+                device=f"vol:{name}",
+                mountpoint="",
+                fstype="unmounted",
+                opts=set(),
+                total=0,
+                free=0,
+                display_name=name,
+                nav_uri="",
+                is_unmounted=True,
+                is_removable=is_removable,
+                gio_icon=volume.get_icon(),
+                gio_volume=volume,
+                can_eject=bool(volume.can_eject() or (drive and drive.can_eject())),
+            ))
     except Exception:
         pass
     return results
@@ -378,7 +467,7 @@ def _refresh_network_places(on_done=None) -> None:
     """
     def _worker():
         global _network_places
-        results = []
+        results: list[MountInfo] = []
         try:
             gfile = Gio.File.new_for_uri("network:///")
             enumerator = gfile.enumerate_children(
@@ -395,22 +484,22 @@ def _refresh_network_places(on_done=None) -> None:
                 target = info.get_attribute_string("standard::target-uri") or ""
                 nav_uri = target or gfile.get_child(info.get_name()).get_uri()
                 if not nav_uri or nav_uri.startswith("network:///"):
-                    # skip sub-containers (e.g. "Windows Network")
-                    # unless they have an explicit target
                     if not target:
                         continue
-                results.append({
-                    "device": nav_uri,
-                    "short": f"netplace:{nav_uri}",
-                    "mountpoint": nav_uri,
-                    "fstype": "network-place",
-                    "opts": set(),
-                    "total": 0, "used": 0, "free": 0, "percent": 0.0,
-                    "display_name": name,
-                    "nav_uri": nav_uri,
-                    "gio_icon": icon,
-                    "is_network_place": True,
-                })
+                results.append(MountInfo(
+                    key=f"netplace:{nav_uri}",
+                    uuid=None,
+                    device=nav_uri,
+                    mountpoint=nav_uri,
+                    fstype="network-place",
+                    opts=set(),
+                    total=0,
+                    free=0,
+                    display_name=name,
+                    nav_uri=nav_uri,
+                    gio_icon=icon,
+                    is_network_place=True,
+                ))
             enumerator.close(None)
         except Exception as e:
             _log(f"network:/// enumerate: {e}")
@@ -421,9 +510,9 @@ def _refresh_network_places(on_done=None) -> None:
     threading.Thread(target=_worker, daemon=True).start()
 
 
-def _refresh(mounts: list[dict]) -> bool:
+def _refresh(mounts: list[MountInfo]) -> bool:
     global _disk_data
-    new_data = {m["short"]: m for m in mounts}
+    new_data = {m.key: m for m in mounts}
     changed = new_data != _disk_data
     _disk_data = new_data
     return changed
@@ -635,6 +724,8 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
         self._windows: dict = {}
         self._polling_started = False
         self._refresh_pending = False  # debounce flag for live-refresh
+        self._local_poll_stop: threading.Event | None = None
+        self._net_poll_stop:   threading.Event | None = None
 
         self._sort_column: str = "name"
         self._sort_reverse: bool = False
@@ -1014,6 +1105,116 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
                 self._populate(win)
         return GLib.SOURCE_REMOVE
 
+    # ── Usage poll workers (armed while panel is visible) ─────────────────────
+
+    def _local_usage_worker(self, stop_event: threading.Event) -> None:
+        """Background thread: refresh local-mount usage on a calm cadence, but only
+        when the disk is idle.
+
+        statvfs blocks for *seconds* and contends with in-flight file operations
+        under ext4 journal load (confirmed: polling statvfs during a copy/delete
+        made those operations sluggish while the panel was visible). So before each
+        sweep we check /proc/diskstats (cheap, no contention): if the disk has I/O
+        in flight we skip this tick entirely — no statvfs, no contention. Once the
+        disk is idle the next tick sweeps and the card updates within ~1s. This is
+        self-correcting (no reliance on catching one exact busy→idle moment).
+        Self-disarms when the panel is hidden (stop_event)."""
+        prev_ticks, _ = _read_io_busy()
+        prev_t = time.monotonic()
+        while not stop_event.wait(_USAGE_GATE_MS / 1000.0):
+            now = time.monotonic()
+            ticks, inflight = _read_io_busy()
+            busy_ms = ticks - prev_ticks
+            elapsed_ms = (now - prev_t) * 1000
+            prev_ticks, prev_t = ticks, now
+
+            if inflight > 0 or busy_ms > _USAGE_BUSY_RATIO * elapsed_ms:
+                continue            # disk busy → skip statvfs (would block & contend)
+
+            updates: dict[str, tuple[int, int]] = {}
+            for key, m in list(_disk_data.items()):
+                if m.is_gio or m.is_unmounted or not m.mountpoint:
+                    continue
+                try:
+                    st = os.statvfs(m.mountpoint)
+                    total = st.f_blocks * st.f_frsize
+                    free  = st.f_bavail * st.f_frsize
+                    if free != m.free or total != m.total:
+                        updates[key] = (total, free)
+                except OSError:
+                    pass
+
+            if updates:
+                GLib.idle_add(self._apply_usage_updates, updates,
+                              priority=GLib.PRIORITY_DEFAULT)
+
+    def _net_usage_worker(self, stop_event: threading.Event) -> None:
+        """Background thread: poll statvfs for GVfs/network FUSE mounts every _USAGE_POLL_NETWORK_MS ms."""
+        while not stop_event.wait(_USAGE_POLL_NETWORK_MS / 1000.0):
+            updates: dict[str, tuple[int, int]] = {}
+            for key, m in list(_disk_data.items()):
+                if not m.is_gio or not m.mountpoint.startswith("/"):
+                    continue  # skip non-GVfs and GVfs without a local FUSE path
+                try:
+                    st = os.statvfs(m.mountpoint)
+                    total = st.f_blocks * st.f_frsize
+                    free  = st.f_bavail * st.f_frsize
+                    if free != m.free or total != m.total:
+                        updates[key] = (total, free)
+                except OSError:
+                    pass
+            if updates:
+                GLib.idle_add(self._apply_usage_updates, updates,
+                              priority=GLib.PRIORITY_DEFAULT)
+
+    def _apply_usage_updates(self, updates: dict) -> bool:
+        """Main-thread callback: patch _disk_data and update card widgets in place."""
+        global _disk_data
+        for key, (total, free) in updates.items():
+            if key not in _disk_data:
+                continue
+            _disk_data[key] = dataclasses.replace(_disk_data[key], total=total, free=free)
+            for state in self._windows.values():
+                if state["stack"].get_visible_child_name() != STACK_DISKINFO:
+                    continue
+                self._update_card_usage(state, key, total, free)
+        return GLib.SOURCE_REMOVE
+
+    def _update_card_usage(self, state: dict, key: str, total: int, free: int) -> None:
+        """Update LevelBar and subtext label for a card via the O(1) card_widgets registry."""
+        entry = state.get("card_widgets", {}).get(key)
+        if entry is None:
+            return
+        bar, sub = entry
+        if bar is not None and total > 0:
+            bar.set_value(min(1.0, (total - free) / total))
+        if sub is not None and total > 0:
+            sub.set_label(f"{_format_size(free)} free of {_format_size(total)}")
+
+    def _ensure_usage_poll_running(self) -> None:
+        """Arm both usage poll workers if not already running."""
+        if self._local_poll_stop is None:
+            ev = threading.Event()
+            self._local_poll_stop = ev
+            threading.Thread(target=self._local_usage_worker, args=(ev,), daemon=True).start()
+        if self._net_poll_stop is None:
+            ev = threading.Event()
+            self._net_poll_stop = ev
+            threading.Thread(target=self._net_usage_worker, args=(ev,), daemon=True).start()
+
+    def _stop_usage_poll_if_idle(self) -> None:
+        """Disarm poll workers when no window is showing the disk panel."""
+        any_visible = any(
+            st["stack"].get_visible_child_name() == STACK_DISKINFO
+            for st in self._windows.values()
+        )
+        if not any_visible:
+            for attr in ("_local_poll_stop", "_net_poll_stop"):
+                ev = getattr(self, attr)
+                if ev is not None:
+                    ev.set()
+                    setattr(self, attr, None)
+
     def _inject_stack(self, nautilus_win: Gtk.Window) -> bool:
         split_view = None
         for w in _all_widgets(nautilus_win):
@@ -1058,6 +1259,8 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
             stack.add_named(files_widget, STACK_FILES)
             stack.add_named(panel, STACK_DISKINFO)
             stack.set_visible_child_name(initial_child)
+            if initial_child == STACK_DISKINFO:
+                self._ensure_usage_poll_running()
         else:
             files_widget = right
             if not files_widget:
@@ -1066,6 +1269,8 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
             stack.add_named(files_widget, STACK_FILES)
             stack.add_named(panel, STACK_DISKINFO)
             stack.set_visible_child_name(initial_child)
+            if initial_child == STACK_DISKINFO:
+                self._ensure_usage_poll_running()
 
         # No transition: a crossfade blends the two children for its duration,
         # and when switching to the panel the file view underneath is already
@@ -1078,12 +1283,13 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
             "panel": panel,
             "grid_box": grid_box,
             "section_flows": [],
+            "card_widgets": {},      # key → (Gtk.LevelBar | None, Gtk.Label | None)
             "_deselecting": False,
             "force_disks": False,
             "initial_title": None,
             "start_on_computer": self._start_on_disks,
             "awaiting_disks": False,
-            "selected_short": None,
+            "selected_key": None,
             "header_motion": None,   # Gtk.EventControllerMotion on the header bar
         }
 
@@ -1153,40 +1359,41 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
             grid_box.remove(child)
             child = nxt
         state["section_flows"] = []
+        state["card_widgets"] = {}
 
         # Classify
         by_group: dict[str, list] = {"system": [], "external": [], "removable": [], "network": []}
         for m in _disk_data.values():
             by_group[_classify_mount(m)].append(m)
 
-        active_uris = {m["nav_uri"] for m in _disk_data.values()}
+        active_uris = {m.nav_uri for m in _disk_data.values()}
         for place in _network_places:
-            if place["nav_uri"] not in active_uris:
+            if place.nav_uri not in active_uris:
                 by_group["network"].append(place)
 
         col = self._sort_column
         rev = self._sort_reverse
 
-        def _sort_key(m: dict):
+        def _sort_key(m: MountInfo):
             if col == "size":
-                return m.get("total", 0)
+                return m.total
             elif col == "type":
-                return m.get("fstype", "")
+                return m.fstype
             else:
-                return (m.get("display_name") or "").lower()
+                return (m.display_name or "").lower()
 
         for gkey in ("system", "external", "removable", "network"):
             items = by_group[gkey]
             if gkey == "system":
-                root_items    = [m for m in items if m.get("mountpoint") == "/"]
-                mounted_items = [m for m in items if m.get("mountpoint") != "/" and not m.get("is_unmounted")]
-                unmounted     = [m for m in items if m.get("is_unmounted")]
+                root_items    = [m for m in items if m.mountpoint == "/"]
+                mounted_items = [m for m in items if m.mountpoint != "/" and not m.is_unmounted]
+                unmounted     = [m for m in items if m.is_unmounted]
                 mounted_items.sort(key=_sort_key, reverse=rev)
                 unmounted.sort(key=_sort_key, reverse=rev)
                 by_group[gkey] = root_items + mounted_items + unmounted
             elif gkey in ("external", "removable"):
-                mounted_items = [m for m in items if not m.get("is_unmounted")]
-                unmounted     = [m for m in items if m.get("is_unmounted")]
+                mounted_items = [m for m in items if not m.is_unmounted]
+                unmounted     = [m for m in items if m.is_unmounted]
                 mounted_items.sort(key=_sort_key, reverse=rev)
                 unmounted.sort(key=_sort_key, reverse=rev)
                 by_group[gkey] = mounted_items + unmounted
@@ -1239,15 +1446,14 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
 
         self._apply_bar_color()
 
-    def _build_disk_card(self, m: dict, group_key: str, win: Gtk.Window) -> Gtk.Widget:
-        is_unmounted = m.get("is_unmounted", False)
-        nav_uri = m.get("nav_uri") or (
-            Gio.File.new_for_path(m["mountpoint"]).get_uri() if m.get("mountpoint") else ""
+    def _build_disk_card(self, m: MountInfo, group_key: str, win: Gtk.Window) -> Gtk.Widget:
+        nav_uri = m.nav_uri or (
+            Gio.File.new_for_path(m.mountpoint).get_uri() if m.mountpoint else ""
         )
 
         card = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         card.get_style_context().add_class("nautilus-view-cell")
-        if is_unmounted:
+        if m.is_unmounted:
             card.get_style_context().add_class("unmounted")
         card.set_margin_start(6)
         card.set_margin_end(6)
@@ -1256,14 +1462,13 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
         card.set_cursor(Gdk.Cursor.new_from_name("pointer"))
         card.set_focusable(True)
         card.set_focus_on_click(True)
-         
+
         icon = Gtk.Image()
         icon.set_pixel_size(_nautilus_icon_size())
         icon.set_valign(Gtk.Align.CENTER)
         icon.set_margin_end(12)
-        gio_icon = m.get("gio_icon")
-        if gio_icon:
-            icon.set_from_gicon(gio_icon)
+        if m.gio_icon:
+            icon.set_from_gicon(m.gio_icon)
         else:
             icon.set_from_icon_name(_GROUP_ICON.get(group_key, "drive-harddisk"))
         card.append(icon)
@@ -1272,7 +1477,7 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
         details.set_hexpand(True)
         details.set_valign(Gtk.Align.CENTER)
 
-        display_name = m.get("display_name") or os.path.basename(m.get("mountpoint", "")) or "/"
+        display_name = m.display_name or os.path.basename(m.mountpoint) or "/"
         name_lbl = Gtk.Label(label=display_name)
         name_lbl.set_xalign(0.0)
         name_lbl.set_ellipsize(3)
@@ -1285,12 +1490,12 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
         bar.set_hexpand(True)
         bar.get_style_context().add_class("diskinfo-bar")
 
-        has_size = m.get("total", 0) > 0
-        if is_unmounted:
+        has_size = m.total > 0
+        if m.is_unmounted:
             bar.set_visible(False)
             sub_text = _("Not mounted")
         elif has_size:
-            v = min(m["percent"] / 100.0, 1.0)
+            v = min(m.percent / 100.0, 1.0)
             bar.set_value(v)
             bar.set_visible(True)
             self._bar_seq += 1
@@ -1299,7 +1504,7 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
             st = self._windows.get(win)
             if st is not None and v > 0:
                 st.setdefault("bar_geom", {})[bname] = v
-            sub_text = f"{_format_size(m['free'])} free of {_format_size(m['total'])}"
+            sub_text = f"{_format_size(m.free)} free of {_format_size(m.total)}"
         else:
             bar.set_visible(False)
             sub_text = nav_uri
@@ -1315,9 +1520,17 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
 
         card.append(details)
 
-        card._disk_data = m
-        card._nav_uri = nav_uri
+        card._mount_key = m.key
+        card._nav_uri   = nav_uri
         card._disk_group = group_key
+
+        # Register bar and sublabel for O(1) in-place usage updates
+        state = self._windows.get(win)
+        if state is not None:
+            state["card_widgets"][m.key] = (
+                bar if has_size else None,
+                sub_lbl if has_size else None,
+            )
 
         right_click = Gtk.GestureClick()
         right_click.set_button(3)
@@ -1334,14 +1547,16 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
         card = child.get_child()
         if card is None:
             return
-        m = getattr(card, "_disk_data", {})
+        mount_key = getattr(card, "_mount_key", None)
+        m = _disk_data.get(mount_key) if mount_key else None
         nav_uri = getattr(card, "_nav_uri", "")
-        if m.get("is_unmounted"):
+        if m and m.is_unmounted:
             self._do_mount(m, win)
             return
         state = self._windows.get(win)
         if state:
             state["stack"].set_visible_child_name(STACK_FILES)
+            self._stop_usage_poll_if_idle()
         GLib.idle_add(self._navigate_to, nav_uri, win)
 
     def _on_flow_selection_changed(self, flow_box: Gtk.FlowBox, win: Gtk.Window) -> None:
@@ -1351,10 +1566,9 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
         selected = flow_box.get_selected_children()
         if selected:
             card = selected[0].get_child()
-            m = getattr(card, "_disk_data", {})
-            state["selected_short"] = m.get("short")
+            state["selected_key"] = getattr(card, "_mount_key", None)
         else:
-            state["selected_short"] = None
+            state["selected_key"] = None
             return
         state["_deselecting"] = True
         for other_flow in state.get("section_flows", []):
@@ -1412,6 +1626,7 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
             if current != STACK_DISKINFO:
                 self._populate(win)
                 stack.set_visible_child_name(STACK_DISKINFO)
+                self._ensure_usage_poll_running()
                 GLib.idle_add(lambda: [f.unselect_all() for f in state.get("section_flows", [])] and False)
 
             # Re-pin the chrome icons (path-bar chip + sidebar row) every time we
@@ -1432,8 +1647,9 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
                 for flow in state.get("section_flows", []):
                     flow.unselect_all()
                 state["_deselecting"] = False
-                state["selected_short"] = None
+                state["selected_key"] = None
             stack.set_visible_child_name(STACK_FILES)
+            self._stop_usage_poll_if_idle()
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
 
@@ -1445,9 +1661,10 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
     def _on_row_key_pressed(self, ctrl, keyval, keycode, state, win: Gtk.Window, row: Gtk.Box) -> bool:
         if keyval not in (Gdk.KEY_Return, Gdk.KEY_KP_Enter, Gdk.KEY_ISO_Enter):
             return False
-        m            = getattr(row, "_disk_data", {})
+        mount_key    = getattr(row, "_mount_key", None)
+        m            = _disk_data.get(mount_key) if mount_key else None
         nav_uri      = getattr(row, "_nav_uri", "")
-        is_unmounted = m.get("is_unmounted", False)
+        is_unmounted = m.is_unmounted if m else False
         ctrl_held    = bool(state & Gdk.ModifierType.CONTROL_MASK)
         shift_held   = bool(state & Gdk.ModifierType.SHIFT_MASK)
         alt_held     = bool(state & Gdk.ModifierType.ALT_MASK)
@@ -1476,16 +1693,17 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
         for flow in state.get("section_flows", []):
             flow.unselect_all()
         state["_deselecting"] = False
-        state["selected_short"] = None
+        state["selected_key"] = None
 
     def _on_disk_right_clicked(self, gesture, _n, x, y, win: Gtk.Window, row: Gtk.Box) -> None:
-        m       = getattr(row, "_disk_data", {})
-        nav_uri = getattr(row, "_nav_uri", "")
-        group   = getattr(row, "_disk_group", "system")
+        mount_key = getattr(row, "_mount_key", None)
+        m         = _disk_data.get(mount_key) if mount_key else None
+        nav_uri   = getattr(row, "_nav_uri", "")
+        group     = getattr(row, "_disk_group", "system")
         gesture.set_state(Gtk.EventSequenceState.CLAIMED)
 
-        is_unmounted = m.get("is_unmounted", False)
-        can_eject    = m.get("can_eject", False)
+        is_unmounted = m.is_unmounted if m else False
+        can_eject    = m.can_eject if m else False
         is_system    = group == "system"
 
         def _accel_item(label, action, accel):
@@ -1537,7 +1755,7 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
                 unmount_act = Gio.SimpleAction.new("unmount", None)
                 unmount_act.connect("activate", lambda *_: self._do_unmount(m))
                 ag.add_action(unmount_act)
-        device = m.get("device", "")
+        device = m.device if m else ""
         if not is_system and device.startswith("/dev/"):
             mid_section.append(_("Format…"), "diskrow.format")
             fmt_act = Gio.SimpleAction.new("format", None)
@@ -1571,6 +1789,7 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
         state = self._windows.get(win)
         if state:
             state["stack"].set_visible_child_name(STACK_FILES)
+            self._stop_usage_poll_if_idle()
         GLib.idle_add(self._navigate_to, nav_uri, win)
 
     def _do_open_tab(self, nav_uri: str, win: Gtk.Window) -> None:
@@ -1586,6 +1805,7 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
         state = self._windows.get(win)
         if state:
             state["stack"].set_visible_child_name(STACK_FILES)
+            self._stop_usage_poll_if_idle()
 
         attempt = [0]
 
@@ -1621,12 +1841,11 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
     def _do_open_window(self, mountpoint: str) -> None:
         subprocess.Popen(["nautilus", "--new-window", mountpoint])
 
-    def _do_mount(self, m: dict, win: Gtk.Window) -> None:
-        volume = m.get("gio_volume")
-        if not volume:
+    def _do_mount(self, m: MountInfo, win: Gtk.Window) -> None:
+        if not m or not m.gio_volume:
             return
         op = Gio.MountOperation.new()
-        volume.mount(Gio.MountMountFlags.NONE, op, None, self._on_mount_finish, win)
+        m.gio_volume.mount(Gio.MountMountFlags.NONE, op, None, self._on_mount_finish, win)
 
     def _on_mount_finish(self, volume, result, win) -> None:
         try:
@@ -1635,12 +1854,11 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
             _log(f"mount failed: {e.message}")
         GLib.idle_add(self._repopulate_visible)
 
-    def _do_unmount(self, m: dict) -> None:
-        mount = m.get("gio_mount")
-        if not mount:
+    def _do_unmount(self, m: MountInfo) -> None:
+        if not m or not m.gio_mount:
             return
         op = Gio.MountOperation.new()
-        mount.unmount_with_operation(Gio.MountUnmountFlags.NONE, op, None, self._on_unmount_finish)
+        m.gio_mount.unmount_with_operation(Gio.MountUnmountFlags.NONE, op, None, self._on_unmount_finish)
 
     def _on_unmount_finish(self, mount, result) -> None:
         try:
@@ -1649,14 +1867,14 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
             _log(f"unmount failed: {e.message}")
         GLib.idle_add(self._repopulate_visible)
 
-    def _do_eject(self, m: dict) -> None:
-        volume = m.get("gio_volume")
-        mount  = m.get("gio_mount")
+    def _do_eject(self, m: MountInfo) -> None:
+        if not m:
+            return
         op = Gio.MountOperation.new()
-        if volume and volume.can_eject():
-            volume.eject_with_operation(Gio.MountUnmountFlags.NONE, op, None, self._on_eject_finish)
-        elif mount and mount.can_eject():
-            mount.eject_with_operation(Gio.MountUnmountFlags.NONE, op, None, self._on_eject_finish)
+        if m.gio_volume and m.gio_volume.can_eject():
+            m.gio_volume.eject_with_operation(Gio.MountUnmountFlags.NONE, op, None, self._on_eject_finish)
+        elif m.gio_mount and m.gio_mount.can_eject():
+            m.gio_mount.eject_with_operation(Gio.MountUnmountFlags.NONE, op, None, self._on_eject_finish)
 
     def _on_eject_finish(self, source, result) -> None:
         try:
