@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nautilus-my-computer"
+version = "0.1.0"
+description = "My Computer for Nautilus, a GNOME file manager extension"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+    {name = "Yann Masoch"}
+]
+license = "MIT"
+dependencies = [
+    "PyGObject",
+]
+keywords = ["gnome", "nautilus", "disk", "filesystem", "extension", "storage", "volumes"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: POSIX :: Linux",
+]
+
+[project.urls]
+Homepage = "https://github.com/yannmasoch/nautilus-my-computer"
+Source = "https://github.com/yannmasoch/nautilus-my-computer"
+Changelog = "https://github.com/yannmasoch/nautilus-my-computer/releases"
+Issues = "https://github.com/yannmasoch/nautilus-my-computer/issues"
+
+[tool.setuptools]
+py-modules = ["nautilus-my-computer"]

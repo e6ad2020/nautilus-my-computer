@@ -1,0 +1,40 @@
+# IDE & Editor
+.vscode/
+.idea/
+.github/
+*.swp
+*.swo
+*~
+
+# Local development
+.env
+.env.local
+.env*.local
+.venv/
+venv/
+.python-version
+__pycache__/
+*.pyc
+
+# Claude AI customization (personal workflow)
+.claude/
+.claudeignore
+CLAUDE.md
+
+# Temporary files & working directories
+project/
+tasks/
+tmp/
+*.tmp
+*.log
+.DS_Store
+Thumbs.db
+
+# Generated/build artifacts
+gschemas.compiled
+*.egg-info/
+dist/
+build/
+
+# Local changelogs & notes
+.local-changelog.md
