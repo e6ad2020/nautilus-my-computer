@@ -2,11 +2,9 @@
 
 # My Computer for Nautilus
 
-**My Computer** is a custom view for GNOME Files (Nautilus), showing all your drives, volumes, and network mounts with usage levels in one clean panel.
+<br>
 
-*"GNOME dropped the Other Locations view and left nothing in its place. I built what should have always been there and in a better way, for the GNOME community with ❤️"*
-
----
+<img width="1366" alt="My Computer for Nautilus" src="assets/images/screenshot.png" />
 
 <br>
 
@@ -15,7 +13,9 @@
 
 <br>
 
-<img width="1366" alt="My Computer for Nautilus" src="assets/images/screenshot.png" />
+**My Computer** is a custom view for GNOME Files (Nautilus), showing all your drives, volumes, and network mounts with usage levels in one clean panel.
+
+*"GNOME dropped the Other Locations view and left nothing in its place. I built what should have always been there and in a better way, for the GNOME community with ❤️"*
 
 </div>
 
