@@ -1,16 +1,23 @@
 #!/usr/bin/env bash
 # install.sh — Nautilus My Computer Extension Installer
-# curl -fsSL https://raw.githubusercontent.com/yannmasoch/nautilus-my-computer/main/install.sh | bash
+#
+# Default (latest release):
+#   curl -fsSL https://raw.githubusercontent.com/yannmasoch/nautilus-my-computer/main/install.sh | bash
+#
+# Pin to a specific version:
+#   VERSION=v0.2.1 curl -fsSL https://raw.githubusercontent.com/yannmasoch/nautilus-my-computer/main/install.sh | bash
 
 main() {
 
 set -euo pipefail
 
+REF_OVERRIDE="${VERSION:-}"
+
 # ─── Colors ───────────────────────────────────────────────────────────────────
-RED='\033[0;31m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-RESET='\033[0m'
+RED=$'\033[0;31m'
+CYAN=$'\033[0;36m'
+BOLD=$'\033[1m'
+RESET=$'\033[0m'
 
 line()      { printf "%-26s" "$1"; echo -e "${CYAN}$2${RESET}"; }
 print_bye() { echo ""; echo -e "${BOLD}${CYAN}👋 Bye${RESET}"; echo ""; }
@@ -116,17 +123,34 @@ check_dependencies() {
     [ -z "$missing" ] || die "Required tools missing:$missing"
 }
 
-# ─── Fetch latest version via GitHub API (Option A) ──────────────────────────
-# Falls back to the main branch when the repo has no published releases yet.
+# ─── Resolve version to install ──────────────────────────────────────────────
+# Always fetches the latest published release into LATEST_RELEASE.
+# If VERSION is set, LATEST is set to that; validate_ref will fall back to
+# LATEST_RELEASE if the specified version does not exist.
+LATEST=""
+LATEST_RELEASE=""
+REF_FALLBACK=false
+
 fetch_latest_version() {
     local response
     response=$(curl -s "https://api.github.com/repos/$REPO/releases/latest") \
         || die "Failed to reach GitHub API."
 
-    LATEST=$(echo "$response" | grep '"tag_name"' | sed 's/.*"tag_name": *"\(.*\)".*/\1/')
-    if [ -z "$LATEST" ]; then
-        LATEST="main"
-        line "Latest release" "none — using main branch"
+    LATEST_RELEASE=$(echo "$response" | grep '"tag_name"' | sed 's/.*"tag_name": *"\(.*\)".*/\1/' || true)
+    [ -z "$LATEST_RELEASE" ] && LATEST_RELEASE="main"
+
+    LATEST="${REF_OVERRIDE:-$LATEST_RELEASE}"
+}
+
+# ─── Validate user-specified VERSION exists on GitHub ────────────────────────
+validate_ref() {
+    [ -n "$REF_OVERRIDE" ] || return
+    local status
+    status=$(curl -s -o /dev/null -w "%{http_code}" \
+        "https://raw.githubusercontent.com/$REPO/$LATEST/$EXT_FILE")
+    if [ "$status" != "200" ]; then
+        REF_FALLBACK=true
+        LATEST="$LATEST_RELEASE"
     fi
 }
 
@@ -212,16 +236,22 @@ do_install() {
 
     if [ "$INSTALL_SOURCE" = "remote" ]; then
         fetch_latest_version
+        validate_ref
         line "Installation type" "GitHub ($LATEST)"
+        if [ -n "$REF_OVERRIDE" ]; then
+            if [ "$REF_FALLBACK" = "true" ]; then
+                line "Selected version" "${CYAN}$REF_OVERRIDE${RESET} not found - using ${CYAN}$LATEST_RELEASE${RESET}"
+            else
+                line "Selected version" "${CYAN}$REF_OVERRIDE${RESET}"
+            fi
+        fi
     else
         line "Installation type" "local"
+        [ -n "$REF_OVERRIDE" ] && line "Selected version" "${CYAN}not available for local installs${RESET}"
     fi
 
     if [ -f "$EXT_DIR/$EXT_FILE" ]; then
         line "Previous installation" "detected"
-        local confirm
-        ask "Update to latest version or reinstall? [Y/n]: " confirm "Y"
-        [[ "$confirm" =~ ^[Yy]$ ]] || { print_bye; return; }
     else
         line "Previous installation" "not detected"
     fi
@@ -288,11 +318,17 @@ do_uninstall() {
 }
 
 # ─── MAIN MENU ────────────────────────────────────────────────────────────────
+if [ -n "$REF_OVERRIDE" ]; then
+    VERSION_LABEL="  ${CYAN}[$REF_OVERRIDE]${RESET}"
+else
+    VERSION_LABEL=""
+fi
+
 echo ""
 echo -e "${BOLD}Nautilus My Computer Extension Installer${RESET}"
-printf '%0.s-' {1..40}; echo
+printf '%0.s─' {1..40}; echo
 echo ""
-echo    "1) Install / Update"
+echo -e "1) Install / Update${VERSION_LABEL}"
 echo    "2) Uninstall"
 echo    "3) Exit"
 echo ""
