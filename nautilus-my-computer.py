@@ -53,10 +53,14 @@ _REFRESH_DEBOUNCE_MS  = 300  # coalesce rapid mount/unmount/plug events
 _WIN_INIT_RETRY_MS    = 20   # retry interval while waiting for NautilusWindow widget tree
 _NAV_RETRY_MS         = 60   # retry interval while navigating to computer:///
 _TAB_WAIT_MS          = 50   # retry interval while waiting for a new tab slot
-_USAGE_GATE_MS        = 1000  # local worker cadence: try a statvfs sweep this often, but skip while the disk is busy
+_USAGE_GATE_MS        = 1000  # local worker idle cadence: try a statvfs sweep this often, but skip while the disk is busy
+_USAGE_POLL_FAST_MS   = 250   # local worker cadence while writes are buffered (Dirty+Writeback elevated) — catch the flush promptly
 _USAGE_BUSY_RATIO     = 0.50  # io_ticks delta / interval above this == disk busy → skip statvfs (avoid I/O contention)
+
+_DIRTY_ACTIVE_THRESHOLD = 4 * 1000 * 1000  # /proc/meminfo Dirty+Writeback ≥ this == writes buffered → poll fast (above resting journal noise)
 _USAGE_POLL_NETWORK_MS = 5000  # async D-Bus usage poll interval for GVfs/network mounts
 _SORT_POLL_MS         = 250  # gvfs sort-metadata poll cadence (only while header is hovered)
+_STALE_RELEASE_FRAMES = 2    # keep detached panel generations alive across this many frame ticks
 
 _FLOW_COLS_GRID      = 8     # max columns in grid (FlowBox) view
 _LIST_MAX_WIDTH      = 450   # max width (px) of a card group in list view
@@ -205,7 +209,7 @@ _GROUPS: list[tuple[str, str]] = [
 
 _disk_data: dict[str, MountInfo] = {}
 _network_places: list[MountInfo] = []  # populated async from network:///
-_sidebar_row_is_ours_cache: dict[str, str | bool] = {}  # row class → prop name or False
+_sidebar_row_destination_prop_cache: dict[str, str | bool] = {}  # row class → property name or False
 
 
 _CSS = b"""
@@ -268,6 +272,29 @@ def _read_io_busy() -> tuple:
     except OSError:
         pass
     return ticks, inflight
+
+
+def _read_dirty_bytes() -> int:
+    """Return Dirty + Writeback bytes from /proc/meminfo (a pure procfs read).
+
+    This is the one *forward* signal for an in-progress file operation: it rises
+    while writes are buffered in the page cache, *before* the kernel flushes them
+    to the device (the moment statvfs/diskstats finally change). It is used ONLY
+    as a cadence hint — poll faster while it is elevated, and force one definitive
+    sweep when it drains (the flush). It is global (not per-device), so it must
+    NEVER be used to estimate or display free space — only to time statvfs."""
+    dirty = writeback = 0
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("Dirty:"):
+                    dirty = int(line.split()[1]) * 1024  # reported in KiB
+                elif line.startswith("Writeback:"):
+                    writeback = int(line.split()[1]) * 1024
+                    break  # Writeback follows Dirty in /proc/meminfo; both seen
+    except (OSError, ValueError, IndexError):
+        pass
+    return dirty + writeback
 
 
 _log(f"Configured URI title: '{_LOCATION_TITLE}' (Bookmark: '{BOOKMARK_LABEL}')")
@@ -527,6 +554,9 @@ def _ensure_bookmark() -> None:
             lines = [l for l in f.read().splitlines() if l.strip()]
     if any(l.split(None, 1)[0] == DISKS_URI for l in lines):
         return  # already present — preserve user's custom label, don't overwrite
+    # GTK bookmarks are stored as "destination-uri optional-label". We key our
+    # sidebar bookmark detection off the destination URI, not the label, so user
+    # renames remain stable.
     lines.insert(0, f"{DISKS_URI} {BOOKMARK_LABEL}")
     with open(BOOKMARKS_FILE, "w") as f:
         f.write("\n".join(lines) + "\n")
@@ -553,6 +583,15 @@ def _all_widgets(widget):
     child = widget.get_first_child()
     while child:
         yield from _all_widgets(child)
+        child = child.get_next_sibling()
+
+
+def _iter_children(widget):
+    if not widget:
+        return
+    child = widget.get_first_child()
+    while child:
+        yield child
         child = child.get_next_sibling()
 
 
@@ -897,9 +936,45 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
         return True
 
     def _on_window_destroyed(self, win: Gtk.Window) -> None:
-        self._windows.pop(win, None)
+        state = self._windows.pop(win, None)
+        if state:
+            tick_id = state.get("stale_release_tick_id")
+            stack = state.get("stack")
+            if tick_id is not None and stack is not None and hasattr(stack, "remove_tick_callback"):
+                stack.remove_tick_callback(tick_id)
+            state["stale_release_tick_id"] = None
+            state["stale_release_ticks"] = 0
+            state.get("stale_generations", []).clear()
         # Stop usage poll workers if this was the last window showing our panel.
         self._stop_usage_poll_if_idle()
+
+    def _on_stack_finalized(self, win: Gtk.Window, state: dict) -> None:
+        if state.get("stack") is None and not state.get("stack_alive", True):
+            return
+        was_visible = state.get("visible_child") == STACK_DISKINFO
+        state["stack"] = None
+        state["stack_alive"] = False
+        state["visible_child"] = None
+        _log(f"stack finalized before window destroy for {type(win).__name__}")
+        if was_visible:
+            GLib.idle_add(self._stop_usage_poll_if_idle)
+
+    def _has_live_stack(self, state: dict, site: str) -> bool:
+        if state.get("stack") is None or not state.get("stack_alive", True):
+            _log(f"{site}: skip dead stack")
+            return False
+        return True
+
+    def _trace_stack_set(self, stack: Gtk.Stack, name: str, site: str) -> None:
+        _log(f"{site}: set_visible_child_name('{name}') on {type(stack).__name__}@0x{id(stack):x}")
+
+    def _set_stack_visible_child(self, state: dict, name: str, site: str) -> bool:
+        if not self._has_live_stack(state, site):
+            return False
+        self._trace_stack_set(state["stack"], name, site)
+        state["stack"].set_visible_child_name(name)
+        state["visible_child"] = name
+        return True
 
     def _on_settings_changed(self, settings: Gio.Settings, key: str) -> None:
         if key == "start-on-disks":
@@ -1006,7 +1081,9 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
 
     def _on_sort_button_active(self, btn: Gtk.MenuButton, _param, nautilus_win: Gtk.Window) -> None:
         state = self._windows.get(nautilus_win)
-        if not state or state["stack"].get_visible_child_name() != STACK_DISKINFO:
+        if not state or not self._has_live_stack(state, "sort button"):
+            return
+        if state.get("visible_child") != STACK_DISKINFO:
             return
         if btn.get_active():
             self._sort_hover = True
@@ -1104,52 +1181,79 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
     def _repopulate_visible(self) -> bool:
         """Repopulate whichever windows are showing the disk view."""
         for win, state in list(self._windows.items()):
-            if state["stack"].get_visible_child_name() == STACK_DISKINFO:
+            if not self._has_live_stack(state, "repopulate_visible"):
+                continue
+            if state.get("visible_child") == STACK_DISKINFO:
                 self._populate(win)
         return GLib.SOURCE_REMOVE
 
     # ── Usage poll workers (armed while panel is visible) ─────────────────────
 
+    def _sweep_local_usage(self) -> None:
+        """Worker-thread only: statvfs every local mount, queue changed usage to
+        the main thread. Pure-read — never writes _disk_data here (that happens on
+        the main thread in _apply_usage_updates via dataclasses.replace)."""
+        updates: dict[str, tuple[int, int]] = {}
+        for key, m in list(_disk_data.items()):
+            if m.is_gio or m.is_unmounted or not m.mountpoint:
+                continue
+            try:
+                st = os.statvfs(m.mountpoint)
+                total = st.f_blocks * st.f_frsize
+                free  = st.f_bavail * st.f_frsize
+                if free != m.free or total != m.total:
+                    updates[key] = (total, free)
+            except OSError:
+                pass
+        if updates:
+            GLib.idle_add(self._apply_usage_updates, updates,
+                          priority=GLib.PRIORITY_DEFAULT)
+
     def _local_usage_worker(self, stop_event: threading.Event) -> None:
-        """Background thread: refresh local-mount usage on a calm cadence, but only
-        when the disk is idle.
+        """Background thread: refresh local-mount usage, adapting cadence to write
+        activity and gating on disk-busy.
 
         statvfs blocks for *seconds* and contends with in-flight file operations
         under ext4 journal load (confirmed: polling statvfs during a copy/delete
-        made those operations sluggish while the panel was visible). So before each
-        sweep we check /proc/diskstats (cheap, no contention): if the disk has I/O
-        in flight we skip this tick entirely — no statvfs, no contention. Once the
-        disk is idle the next tick sweeps and the card updates within ~1s. This is
-        self-correcting (no reliance on catching one exact busy→idle moment).
+        made those operations sluggish while the panel was visible). So normally we
+        check /proc/diskstats first (cheap, no contention): if the disk has I/O in
+        flight we skip the sweep — no statvfs, no contention.
+
+        Two refinements make the panel feel live without breaking that gate:
+          • An immediate ungated sweep on entry, so arriving at the panel (e.g.
+            navigating back after a copy) shows fresh numbers at once instead of
+            the stale cache _populate() rendered.
+          • A /proc/meminfo Dirty+Writeback forward signal (cadence only, never
+            used to estimate free space): poll fast while writes are buffered, and
+            force one definitive sweep the instant dirty pages drain — the flush,
+            i.e. exactly when statvfs finally changes — even if the busy-gate would
+            otherwise skip it.
+
         Self-disarms when the panel is hidden (stop_event)."""
         prev_ticks, _ = _read_io_busy()
         prev_t = time.monotonic()
-        while not stop_event.wait(_USAGE_GATE_MS / 1000.0):
+        was_active = _read_dirty_bytes() >= _DIRTY_ACTIVE_THRESHOLD
+        while True:
+            interval = _USAGE_POLL_FAST_MS if was_active else _USAGE_GATE_MS
+            if stop_event.wait(interval / 1000.0):
+                break
+
             now = time.monotonic()
             ticks, inflight = _read_io_busy()
             busy_ms = ticks - prev_ticks
             elapsed_ms = (now - prev_t) * 1000
             prev_ticks, prev_t = ticks, now
 
-            if inflight > 0 or busy_ms > _USAGE_BUSY_RATIO * elapsed_ms:
-                continue            # disk busy → skip statvfs (would block & contend)
+            is_active = _read_dirty_bytes() >= _DIRTY_ACTIVE_THRESHOLD
+            just_flushed = was_active and not is_active   # buffered writes hit disk
+            was_active = is_active
 
-            updates: dict[str, tuple[int, int]] = {}
-            for key, m in list(_disk_data.items()):
-                if m.is_gio or m.is_unmounted or not m.mountpoint:
-                    continue
-                try:
-                    st = os.statvfs(m.mountpoint)
-                    total = st.f_blocks * st.f_frsize
-                    free  = st.f_bavail * st.f_frsize
-                    if free != m.free or total != m.total:
-                        updates[key] = (total, free)
-                except OSError:
-                    pass
+            # Skip while the disk is busy — except right after a flush, when the
+            # post-flush value is exactly what we need and must not be missed.
+            if not just_flushed and (inflight > 0 or busy_ms > _USAGE_BUSY_RATIO * elapsed_ms):
+                continue
 
-            if updates:
-                GLib.idle_add(self._apply_usage_updates, updates,
-                              priority=GLib.PRIORITY_DEFAULT)
+            self._sweep_local_usage()
 
     def _net_usage_tick(self) -> bool:
         """GLib timer callback: fire async D-Bus usage queries for all GVfs/network mounts."""
@@ -1186,7 +1290,9 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
                 continue
             _disk_data[key] = dataclasses.replace(_disk_data[key], total=total, free=free)
             for state in self._windows.values():
-                if state["stack"].get_visible_child_name() != STACK_DISKINFO:
+                if not self._has_live_stack(state, "apply_usage_updates"):
+                    continue
+                if state.get("visible_child") != STACK_DISKINFO:
                     continue
                 self._update_card_usage(state, key, total, free)
         return GLib.SOURCE_REMOVE
@@ -1216,7 +1322,9 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
     def _stop_usage_poll_if_idle(self) -> None:
         """Disarm poll workers when no window is showing the disk panel."""
         any_visible = any(
-            st["stack"].get_visible_child_name() == STACK_DISKINFO
+            st.get("stack") is not None
+            and st.get("stack_alive", True)
+            and st.get("visible_child") == STACK_DISKINFO
             for st in self._windows.values()
         )
         if not any_visible:
@@ -1248,23 +1356,14 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
                     toolbar_view = w
                     break
 
-        panel, grid_box = self._build_panel(nautilus_win)
+        panel, grid_host, grid_box = self._build_panel(nautilus_win)
         stack = Gtk.Stack()
 
-        # Decide the very first frame. When start-on-computer is enabled and this
-        # is a fresh/default window (no title yet, or already at Home/Computer),
-        # render the disk panel as the initial child so the user never sees a
-        # flash of the file view before we switch. A window explicitly opened to
-        # a specific folder (title already set to something else) keeps the file
-        # view as the first frame, avoiding a reverse-flash.
-        title = nautilus_win.get_title() or ""
-        show_disks_first = (
-            self._start_on_disks
-            and (_is_unsettled_title(title)
-                 or title == _HOME_TITLE
-                 or _LOCATION_TITLE in title)
-        )
-        initial_child = STACK_DISKINFO if show_disks_first else STACK_FILES
+        # Always start on STACK_FILES. Selecting STACK_DISKINFO here (during
+        # ToolbarView replacement) triggered a GTK_IS_STACK assertion and the
+        # startup UAF crash — the stack isn't settled until _on_title_changed()
+        # fires after Nautilus completes its location resolution.
+        initial_child = STACK_FILES
 
         if toolbar_view:
             files_widget = toolbar_view.get_content()
@@ -1273,9 +1372,8 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
             toolbar_view.set_content(stack)
             stack.add_named(files_widget, STACK_FILES)
             stack.add_named(panel, STACK_DISKINFO)
+            self._trace_stack_set(stack, initial_child, "inject_stack toolbar initial")
             stack.set_visible_child_name(initial_child)
-            if initial_child == STACK_DISKINFO:
-                self._ensure_usage_poll_running()
         else:
             files_widget = right
             if not files_widget:
@@ -1283,9 +1381,8 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
             split_view.set_content(stack)
             stack.add_named(files_widget, STACK_FILES)
             stack.add_named(panel, STACK_DISKINFO)
+            self._trace_stack_set(stack, initial_child, "inject_stack split initial")
             stack.set_visible_child_name(initial_child)
-            if initial_child == STACK_DISKINFO:
-                self._ensure_usage_poll_running()
 
         # No transition: a crossfade blends the two children for its duration,
         # and when switching to the panel the file view underneath is already
@@ -1295,10 +1392,16 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
 
         self._windows[nautilus_win] = {
             "stack": stack,
+            "stack_alive": True,
+            "visible_child": initial_child,
             "panel": panel,
+            "grid_host": grid_host,
             "grid_box": grid_box,
             "section_flows": [],
             "card_widgets": {},      # key → (Gtk.LevelBar | None, Gtk.Label | None)
+            "stale_generations": [],
+            "stale_release_tick_id": None,
+            "stale_release_ticks": 0,
             "_deselecting": False,
             "force_disks": False,
             "initial_title": None,
@@ -1307,14 +1410,51 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
             "selected_key": None,
             "header_motion": None,   # Gtk.EventControllerMotion on the header bar
         }
+        stack.weak_ref(lambda w=nautilus_win, st=self._windows.get(nautilus_win): self._on_stack_finalized(w, st) if st is not None else None)
 
-        # Populate the panel up front so the first frame isn't an empty view.
-        if show_disks_first:
-            self._populate(nautilus_win)
+        # If this window is headed to computer:///, let the later title-change
+        # path do the first populate + switch once Nautilus has settled.
 
         return True
 
     # ── Panel construction ────────────────────────────────────────────────────
+
+    def _new_grid_box(self) -> Gtk.Box:
+        grid_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=24)
+        grid_box.set_hexpand(True)
+        grid_box.set_valign(Gtk.Align.START)
+        grid_box.set_margin_start(18)
+        grid_box.set_margin_end(18)
+        grid_box.set_margin_top(18)
+        grid_box.set_margin_bottom(18)
+        return grid_box
+
+    def _release_stale_generations(self, state: dict) -> bool:
+        state.get("stale_generations", []).clear()
+        state["stale_release_tick_id"] = None
+        state["stale_release_ticks"] = 0
+        return GLib.SOURCE_REMOVE
+
+    def _queue_stale_generation_release(self, state: dict, root: Gtk.Widget) -> None:
+        stale = state.setdefault("stale_generations", [])
+        stale.append(root)
+        state["stale_release_ticks"] = _STALE_RELEASE_FRAMES
+        if state.get("stale_release_tick_id") is not None:
+            return
+
+        owner = state.get("stack")
+        if owner is None or not hasattr(owner, "add_tick_callback"):
+            GLib.timeout_add(50, lambda st=state: self._release_stale_generations(st))
+            return
+
+        def _release_on_tick(_widget, _frame_clock, st=state):
+            ticks_left = max(0, st.get("stale_release_ticks", 0) - 1)
+            st["stale_release_ticks"] = ticks_left
+            if ticks_left > 0:
+                return GLib.SOURCE_CONTINUE
+            return self._release_stale_generations(st)
+
+        state["stale_release_tick_id"] = owner.add_tick_callback(_release_on_tick)
 
     def _build_panel(self, win: Gtk.Window) -> tuple:
         panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -1326,13 +1466,7 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
         scroll.set_vexpand(True)
         scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
 
-        grid_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=24)
-        grid_box.set_hexpand(True)
-        grid_box.set_valign(Gtk.Align.START)
-        grid_box.set_margin_start(18)
-        grid_box.set_margin_end(18)
-        grid_box.set_margin_top(18)
-        grid_box.set_margin_bottom(18)
+        grid_box = self._new_grid_box()
 
         scroll.set_child(grid_box)
         panel.append(scroll)
@@ -1342,7 +1476,7 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
         bg_deselect.connect("pressed", self._on_panel_clicked, win)
         scroll.add_controller(bg_deselect)
 
-        return panel, grid_box
+        return panel, scroll, grid_box
 
     def _sort_debug_label(self) -> str:
         col = self._sort_column
@@ -1364,17 +1498,10 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
         if state is None:
             return
 
-        state["bar_geom"] = {}  # reset per-bar gradient geometry for this window
-        grid_box = state["grid_box"]
-
-        # Clear grid_box
-        child = grid_box.get_first_child()
-        while child:
-            nxt = child.get_next_sibling()
-            grid_box.remove(child)
-            child = nxt
-        state["section_flows"] = []
-        state["card_widgets"] = {}
+        grid_box = self._new_grid_box()
+        section_flows: list[Gtk.FlowBox] = []
+        card_widgets = {}
+        bar_geom = {}
 
         # Classify
         by_group: dict[str, list] = {"system": [], "external": [], "removable": [], "network": []}
@@ -1446,9 +1573,9 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
             container.get_style_context().add_class("view")
             container.connect("child-activated", self._on_card_activated, win)
             container.connect("selected-children-changed", self._on_flow_selection_changed, win)
-            state["section_flows"].append(container)
+            section_flows.append(container)
             for m in items:
-                card = self._build_disk_card(m, group_key, win)
+                card = self._build_disk_card(m, group_key, win, card_widgets, bar_geom)
                 size_group.add_widget(card)
                 container.append(card)
 
@@ -1459,9 +1586,19 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
             else:
                 grid_box.append(container)
 
+        old_grid_box = state.get("grid_box")
+        state["bar_geom"] = bar_geom
+        state["grid_box"] = grid_box
+        state["section_flows"] = section_flows
+        state["card_widgets"] = card_widgets
+        state["grid_host"].set_child(grid_box)
+        if old_grid_box is not None:
+            self._queue_stale_generation_release(state, old_grid_box)
+
         self._apply_bar_color()
 
-    def _build_disk_card(self, m: MountInfo, group_key: str, win: Gtk.Window) -> Gtk.Widget:
+    def _build_disk_card(self, m: MountInfo, group_key: str, win: Gtk.Window,
+                         card_widgets: dict, bar_geom: dict) -> Gtk.Widget:
         nav_uri = m.nav_uri or (
             Gio.File.new_for_path(m.mountpoint).get_uri() if m.mountpoint else ""
         )
@@ -1516,9 +1653,8 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
             self._bar_seq += 1
             bname = f"diskbar{self._bar_seq}"
             bar.set_name(bname)
-            st = self._windows.get(win)
-            if st is not None and v > 0:
-                st.setdefault("bar_geom", {})[bname] = v
+            if v > 0:
+                bar_geom[bname] = v
             sub_text = f"{_format_size(m.free)} free of {_format_size(m.total)}"
         else:
             bar.set_visible(False)
@@ -1540,12 +1676,10 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
         card._disk_group = group_key
 
         # Register bar and sublabel for O(1) in-place usage updates
-        state = self._windows.get(win)
-        if state is not None:
-            state["card_widgets"][m.key] = (
-                bar if has_size else None,
-                sub_lbl if has_size else None,
-            )
+        card_widgets[m.key] = (
+            bar if has_size else None,
+            sub_lbl if has_size else None,
+        )
 
         right_click = Gtk.GestureClick()
         right_click.set_button(3)
@@ -1593,13 +1727,14 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
         state = self._windows.get(win)
         if not state:
             return
+        if not self._has_live_stack(state, "title changed"):
+            return
 
         # Ensure we have the pathbar and sidebar fixed
         if not state.get("pathbar"):
             self._attach_pathbar(win)
         self._fix_sidebar_icon(win)
 
-        stack = state["stack"]
         current_title = win.get_title() or ""
         in_view = _LOCATION_TITLE in current_title
 
@@ -1632,11 +1767,12 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
             else:
                 in_view = True
 
-        current = stack.get_visible_child_name()
+        current = state.get("visible_child")
         if in_view:
             if current != STACK_DISKINFO:
                 self._populate(win)
-                stack.set_visible_child_name(STACK_DISKINFO)
+                if not self._set_stack_visible_child(state, STACK_DISKINFO, "title changed show diskinfo"):
+                    return
                 self._ensure_usage_poll_running()
                 GLib.idle_add(lambda: [f.unselect_all() for f in state.get("section_flows", [])] and False)
 
@@ -1659,7 +1795,8 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
                     flow.unselect_all()
                 state["_deselecting"] = False
                 state["selected_key"] = None
-            stack.set_visible_child_name(STACK_FILES)
+            if not self._set_stack_visible_child(state, STACK_FILES, "title changed show files"):
+                return
             self._stop_usage_poll_if_idle()
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
@@ -1810,8 +1947,7 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
 
         # Switch to the files view first — new-tab action requires the TabView to be visible.
         state = self._windows.get(win)
-        if state:
-            state["stack"].set_visible_child_name(STACK_FILES)
+        if state and self._set_stack_visible_child(state, STACK_FILES, "open_tab show files"):
             self._stop_usage_poll_if_idle()
 
         attempt = [0]
@@ -2150,15 +2286,16 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
     # ── Chrome icon fix (sidebar row + path bar chip) ────────────────────────
 
     @staticmethod
-    def _sidebar_row_is_ours(row) -> bool:
-        """True if *row* points to DISKS_URI, regardless of the user-set label.
+    def _sidebar_row_destination(row) -> str | None:
+        """Return the sidebar row's destination URI, if the row exposes one.
 
-        Tries URI-based detection first (works even if the bookmark was renamed).
-        Caches per row-type which property name works to avoid repeated exceptions.
-        Falls back to label matching for row types that don't expose a URI property.
+        The bookmark row is created by Nautilus from the GTK bookmarks file, so
+        we do not control its widget ids. The stable identifier we *do* control
+        is the bookmark destination URI (`computer:///`). Cache the working
+        property name per row class to avoid repeated exception-driven probing.
         """
         cls = type(row).__name__
-        prop_cache = _sidebar_row_is_ours_cache  # module-level dict
+        prop_cache = _sidebar_row_destination_prop_cache  # module-level dict
         known_prop = prop_cache.get(cls)  # None = unknown, False = no property
         if known_prop is not False:
             for prop in ([known_prop] if known_prop else ("uri", "location")):
@@ -2167,21 +2304,74 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
                     if known_prop is None:
                         prop_cache[cls] = prop  # remember what works
                     if isinstance(val, Gio.File):
-                        return val.get_uri().rstrip("/") == DISKS_URI.rstrip("/")
+                        return val.get_uri().rstrip("/")
                     if isinstance(val, str) and val:
-                        return val.rstrip("/") == DISKS_URI.rstrip("/")
-                    return False
+                        return val.rstrip("/")
+                    return None
                 except Exception:
                     pass
             if known_prop is None:
                 prop_cache[cls] = False  # no URI property found for this type
-        # Label fallback — covers row types with no accessible URI property.
-        for w in _all_widgets(row):
-            if isinstance(w, Gtk.Label):
-                t = (w.get_label() or "").strip()
-                if t in (BOOKMARK_LABEL, _LOCATION_TITLE):
-                    return True
+        return None
+
+    @classmethod
+    def _sidebar_row_is_ours(cls, row) -> bool:
+        """True if *row* points to DISKS_URI, independent of bookmark label."""
+        return cls._sidebar_row_destination(row) == DISKS_URI.rstrip("/")
+
+    @staticmethod
+    def _widget_has_button_ancestor(widget, stop) -> bool:
+        parent = widget.get_parent() if widget else None
+        while parent and parent is not stop:
+            if isinstance(parent, Gtk.Button):
+                return True
+            parent = parent.get_parent()
         return False
+
+    def _find_sidebar_row_icon(self, row):
+        """Return the leading icon widget for a matched sidebar row.
+
+        We do not control NautilusSidebarRow construction, so we cannot attach a
+        buildable_id to our bookmark row. Instead, identify the row by URI/label,
+        then locate the icon structurally relative to the row's primary label:
+        walk from that label upward and look for a sibling branch before it that
+        contains an image outside any button subtree. This avoids relying on the
+        first Gtk.Image in the whole row.
+        """
+
+        label = next(
+            (
+                w for w in _all_widgets(row)
+                if isinstance(w, Gtk.Label)
+                and (w.get_label() or "").strip()
+                and not self._widget_has_button_ancestor(w, row)
+            ),
+            None,
+        )
+
+        def _find_image_in_branch(root):
+            for w in _all_widgets(root):
+                if not isinstance(w, Gtk.Image):
+                    continue
+                if self._widget_has_button_ancestor(w, row):
+                    continue
+                return w
+            return None
+
+        if label is not None:
+            branch = label
+            container = label.get_parent()
+            while container and container is not row:
+                for child in _iter_children(container):
+                    if child is branch:
+                        break
+                    image = _find_image_in_branch(child)
+                    if image is not None:
+                        return image
+                branch = container
+                container = container.get_parent()
+
+        return _find_image_in_branch(row)
 
     def _fix_sidebar_icon(self, win: Gtk.Window) -> bool:
         """Pin the COMPUTER_ICON on our sidebar bookmark row.
@@ -2189,7 +2379,10 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
         Matches by destination URI (DISKS_URI) so renaming the bookmark does not
         break the icon. Nautilus assigns computer:/// a folder-remote-symbolic
         gicon, so content-based detection never matches — hence _pin_icon.
-        Within the matched row we pin the first Gtk.Image (the leading icon).
+        The bookmark row itself is created by Nautilus, so we cannot add our own
+        buildable_id to it; the stable identity we control is the destination URI.
+        Once the row is matched, locate the leading icon structurally relative to
+        the row label instead of pinning the first Gtk.Image in the subtree.
         """
         split_view = next((w for w in _all_widgets(win) if isinstance(w, Adw.OverlaySplitView)), None)
         sidebar_root = split_view.get_sidebar() if split_view else None
@@ -2207,22 +2400,20 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
             row = nav_box.get_first_child()
             while row:
                 if self._sidebar_row_is_ours(row):
-                    for w in _all_widgets(row):
-                        if isinstance(w, Gtk.Image):
-                            _pin_icon(w, COMPUTER_ICON)
-                            found = True
-                            break
+                    image = self._find_sidebar_row_icon(row)
+                    if image is not None:
+                        _pin_icon(image, COMPUTER_ICON)
+                        found = True
                 row = row.get_next_sibling()
         else:
             for row in _all_widgets(sidebar_root):
                 if type(row).__name__ != "NautilusSidebarRow":
                     continue
                 if self._sidebar_row_is_ours(row):
-                    for w in _all_widgets(row):
-                        if isinstance(w, Gtk.Image):
-                            _pin_icon(w, COMPUTER_ICON)
-                            found = True
-                            break
+                    image = self._find_sidebar_row_icon(row)
+                    if image is not None:
+                        _pin_icon(image, COMPUTER_ICON)
+                        found = True
 
         return found
 
