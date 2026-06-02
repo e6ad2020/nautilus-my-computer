@@ -1,6 +1,7 @@
 import dataclasses
 import gettext
 import os
+import re
 import subprocess
 import threading
 import time
@@ -154,6 +155,8 @@ NETWORK_FSTYPES = {
     "gvfsd-fuse",
 }
 
+OPTICAL_FSTYPES = {"iso9660", "udf"}
+
 # Mountpoint prefixes that indicate removable / external media
 EXTERNAL_PREFIXES = ("/media/", "/run/media/", "/mnt/")
 
@@ -201,6 +204,27 @@ class MountInfo:
         return round(self.used / self.total * 100, 1) if self.total > 0 else 0.0
 
 
+_MOUNT_ESCAPE_RE = re.compile(r"\\([0-7]{3})")
+
+
+def _unescape_mount_field(s: str) -> str:
+    """Decode octal escapes written by the kernel in /proc/mounts (space=\\040, etc.)."""
+    return _MOUNT_ESCAPE_RE.sub(lambda m: chr(int(m.group(1), 8)), s)
+
+
+def _gicon_renders(gicon) -> bool:
+    """True if gicon is non-None and resolves in the current icon theme."""
+    if gicon is None:
+        return False
+    if isinstance(gicon, Gio.ThemedIcon):
+        try:
+            theme = Gtk.IconTheme.get_for_display(Gdk.Display.get_default())
+        except Exception:
+            return True
+        return any(theme.has_icon(n) for n in gicon.get_names())
+    return True
+
+
 def _build_uuid_map() -> dict[str, str]:
     """Return {real_device_path: uuid_string} from /dev/disk/by-uuid."""
     result: dict[str, str] = {}
@@ -232,6 +256,10 @@ def _classify_mount(m: MountInfo) -> str:
             return "removable"
         return "network"
 
+    # Optical filesystems (loop-mounted images and physical discs)
+    if m.fstype in OPTICAL_FSTYPES:
+        return "disc"
+
     # Removable-media paths always → check removable flag first, then external.
     # This ensures NTFS/fuseblk drives at /run/media/ are not misclassified
     # as network just because their fstype starts with "fuse".
@@ -250,6 +278,7 @@ _GROUP_ICON = {
     "system": "drive-harddisk",
     "external": "drive-harddisk",
     "removable": "drive-removable-media",
+    "disc": "media-optical",
     "network": "folder-remote",
 }
 
@@ -258,6 +287,7 @@ _GROUPS: list[tuple[str, str]] = [
     ("system", "System"),
     ("external", "Devices and Drives"),
     ("removable", "Removable Devices"),
+    ("disc", "Disc Images"),
     ("network", "Network Volumes"),
 ]
 
@@ -401,7 +431,9 @@ def _scan_mounts() -> list[MountInfo]:
                 parts = line.split()
                 if len(parts) < 4:
                     continue
-                device, mountpoint, fstype, options = parts[0], parts[1], parts[2], parts[3]
+                device = _unescape_mount_field(parts[0])
+                mountpoint = _unescape_mount_field(parts[1])
+                fstype, options = parts[2], parts[3]
                 opts = set(options.split(","))
                 gvfs_show = "x-gvfs-show" in opts
                 is_external = any(mountpoint.startswith(p) for p in EXTERNAL_PREFIXES)
@@ -1604,7 +1636,13 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
         bar_geom = {}
 
         # Classify
-        by_group: dict[str, list] = {"system": [], "external": [], "removable": [], "network": []}
+        by_group: dict[str, list] = {
+            "system": [],
+            "external": [],
+            "removable": [],
+            "disc": [],
+            "network": [],
+        }
         for m in _disk_data.values():
             by_group[_classify_mount(m)].append(m)
 
@@ -1624,7 +1662,7 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
             else:
                 return (m.display_name or "").lower()
 
-        for gkey in ("system", "external", "removable", "network"):
+        for gkey in ("system", "external", "removable", "disc", "network"):
             items = by_group[gkey]
             if gkey == "system":
                 root_items = [m for m in items if m.mountpoint == "/"]
@@ -1719,7 +1757,7 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
         icon.set_pixel_size(_nautilus_icon_size())
         icon.set_valign(Gtk.Align.CENTER)
         icon.set_margin_end(12)
-        if m.gio_icon:
+        if _gicon_renders(m.gio_icon):
             icon.set_from_gicon(m.gio_icon)
         else:
             icon.set_from_icon_name(_GROUP_ICON.get(group_key, "drive-harddisk"))

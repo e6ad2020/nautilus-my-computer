@@ -24,6 +24,9 @@ msgstr "الأجهزة ومحركات الأقراص"
 msgid "Removable Devices"
 msgstr "الأجهزة القابلة للإزالة"
 
+msgid "Disc Images"
+msgstr ""
+
 msgid "Network Volumes"
 msgstr "مجلدات الشبكة"
 

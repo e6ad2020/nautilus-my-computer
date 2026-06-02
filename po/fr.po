@@ -24,6 +24,9 @@ msgstr "Appareils et disques"
 msgid "Removable Devices"
 msgstr "Périphériques amovibles"
 
+msgid "Disc Images"
+msgstr "Images disque"
+
 msgid "Network Volumes"
 msgstr "Volumes réseau"
 
