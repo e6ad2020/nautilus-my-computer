@@ -8,8 +8,6 @@ set -euo pipefail
 
 # ─── Colors ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 BOLD='\033[1m'
 RESET='\033[0m'
@@ -143,7 +141,9 @@ download_files() {
 
         # Download translation files
         mkdir -p "$TEMP_DIR/po"
-        for lang in ar fr; do
+        langs=$(curl -fsSL "https://api.github.com/repos/$REPO/contents/po?ref=$LATEST" \
+            | grep '"name"' | sed 's/.*"name": "\(.*\)\.po".*/\1/' | grep -v '"name"') || true
+        for lang in $langs; do
             curl -fsSL "$base/po/$lang.po" -o "$TEMP_DIR/po/$lang.po" || true
         done
     else
@@ -160,29 +160,33 @@ download_files() {
 
 # ─── Install extension + schema ───────────────────────────────────────────────
 install_files() {
+    # Extension
     mkdir -p "$EXT_DIR"
     cp "$TEMP_DIR/$EXT_FILE" "$EXT_DIR/$EXT_FILE"
     rm -f "$EXT_DIR/__pycache__/nautilus-my-computer.cpython-"*.pyc 2>/dev/null || true
     line "Extension installed" "$EXT_DIR/$EXT_FILE"
 
+    # Schema
     mkdir -p "$USER_SCHEMA_DIR"
     cp "$TEMP_DIR/$SCHEMA_FILE" "$USER_SCHEMA_DIR/$SCHEMA_FILE"
     line "Preferences installed" "$USER_SCHEMA_DIR/$SCHEMA_FILE"
     glib-compile-schemas "$USER_SCHEMA_DIR"
 
-    # Compile and install gettext translations
-    if [ -d "$TEMP_DIR/po" ] && command -v msgfmt >/dev/null 2>&1; then
-        for po_file in "$TEMP_DIR"/po/*.po; do
-            if [ -f "$po_file" ]; then
-                lang=$(basename "$po_file" .po)
-                loc_dir="$HOME/.local/share/locale/$lang/LC_MESSAGES"
-                mkdir -p "$loc_dir"
-                msgfmt "$po_file" -o "$loc_dir/nautilus-my-computer.mo"
-                line "Translation ($lang) installed" "$loc_dir/nautilus-my-computer.mo"
-            fi
-        done
-    fi
+    # Translations (if any)
+    [ -d "$TEMP_DIR/po" ] || return
+    command -v msgfmt >/dev/null 2>&1 || return
+    local langs_installed=""
+    for po_file in "$TEMP_DIR"/po/*.po; do
+        [ -f "$po_file" ] || continue
+        lang=$(basename "$po_file" .po)
+        loc_dir="$HOME/.local/share/locale/$lang/LC_MESSAGES"
+        mkdir -p "$loc_dir"
+        msgfmt "$po_file" -o "$loc_dir/nautilus-my-computer.mo"
+        langs_installed="${langs_installed:+$langs_installed, }$lang"
+    done
+    [ -n "$langs_installed" ] && line "Translations installed" "$langs_installed"
 }
+
 
 # ─── Restart Nautilus ─────────────────────────────────────────────────────────
 offer_restart() {
@@ -240,6 +244,7 @@ do_uninstall() {
 
     local found=false
 
+    # Extension
     if [ -f "$EXT_DIR/$EXT_FILE" ]; then
         rm -f "$EXT_DIR/$EXT_FILE"
         rm -f "$EXT_DIR/__pycache__/nautilus-my-computer.cpython-"*.pyc 2>/dev/null || true
@@ -247,6 +252,7 @@ do_uninstall() {
         found=true
     fi
 
+    # Schema
     if [ -f "$USER_SCHEMA_DIR/$SCHEMA_FILE" ]; then
         gsettings reset-recursively io.github.yannmasoch.nautilus-my-computer 2>/dev/null || true
         rm -f "$USER_SCHEMA_DIR/$SCHEMA_FILE"
@@ -255,17 +261,20 @@ do_uninstall() {
         found=true
     fi
 
-    # Remove compiled translations
+    # Translations
     local loc_dir_prefix="$HOME/.local/share/locale"
+    local langs_removed=""
     if [ -d "$loc_dir_prefix" ]; then
         for mo_file in "$loc_dir_prefix"/*/LC_MESSAGES/nautilus-my-computer.mo; do
             if [ -f "$mo_file" ]; then
+                lang=$(echo "$mo_file" | sed "s|$loc_dir_prefix/\(.*\)/LC_MESSAGES.*|\1|")
                 rm -f "$mo_file"
-                line "Translation removed" "$mo_file"
+                langs_removed="${langs_removed:+$langs_removed, }$lang"
                 found=true
             fi
         done
     fi
+    [ -n "$langs_removed" ] && line "Translation(s) removed" "$langs_removed"
 
     if [ "$found" = false ]; then
         line "Nothing to uninstall" "extension was not found"

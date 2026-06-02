@@ -67,10 +67,10 @@ msgid "End color"
 msgstr "Couleur de fin"
 
 msgid "Sidebar Bookmark"
-msgstr "Signet de la barre latérale"
+msgstr "Signet"
 
 msgid "The \"Computer\" bookmark gives access to this panel from the sidebar. Restore it here if you accidentally removed it."
-msgstr "Le signet « Ordinateur » donne accès à ce panneau depuis la barre latérale. Restaurez-le ici si vous l'avez supprimé par erreur."
+msgstr "Le signet « Ordinateur » donne accès à ce panneau depuis les signets. Restaurez-le ici si vous l'avez supprimé par erreur."
 
 msgid "Restore \"Computer\" bookmark"
 msgstr "Restaurer le signet « Ordinateur »"

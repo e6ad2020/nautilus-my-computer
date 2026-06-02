@@ -2189,8 +2189,7 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
         bookmark_group = Adw.PreferencesGroup()
         bookmark_group.set_title(_("Sidebar Bookmark"))
         bookmark_group.set_description(_(
-            'The “Computer” bookmark gives access to this panel from the sidebar. '
-            "Restore it here if you accidentally removed it."
+            "The \"Computer\" bookmark gives access to this panel from the sidebar. Restore it here if you accidentally removed it."
         ))
         page.add(bookmark_group)
 
