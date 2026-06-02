@@ -91,6 +91,22 @@ ensure_nautilus_python() {
     line "$NP_PKG" "installed"
 }
 
+ensure_gettext() {
+    if command -v msgfmt >/dev/null 2>&1; then
+        line "gettext (msgfmt)" "detected"
+        return
+    fi
+    line "gettext (msgfmt)" "not detected — installing..."
+    case "$PM" in
+        pacman) sudo pacman -S --noconfirm gettext ;;
+        apt)    sudo apt-get install -y gettext ;;
+        dnf)    sudo dnf install -y gettext ;;
+        zypper) sudo zypper install -y gettext-tools ;;
+    esac
+    command -v msgfmt >/dev/null 2>&1 || die "gettext (msgfmt) installation failed. Install gettext manually and re-run."
+    line "gettext (msgfmt)" "installed"
+}
+
 # ─── Dependency check ─────────────────────────────────────────────────────────
 check_dependencies() {
     local missing=""
@@ -124,9 +140,18 @@ download_files() {
             || die "Failed to download $EXT_FILE"
         curl -fsSL "$base/$SCHEMA_FILE" -o "$TEMP_DIR/$SCHEMA_FILE" \
             || die "Failed to download $SCHEMA_FILE"
+
+        # Download translation files
+        mkdir -p "$TEMP_DIR/po"
+        for lang in ar fr; do
+            curl -fsSL "$base/po/$lang.po" -o "$TEMP_DIR/po/$lang.po" || true
+        done
     else
         cp "$INSTALL_SOURCE/$EXT_FILE"    "$TEMP_DIR/$EXT_FILE"    || die "Local $EXT_FILE not found"
         cp "$INSTALL_SOURCE/$SCHEMA_FILE" "$TEMP_DIR/$SCHEMA_FILE" || die "Local $SCHEMA_FILE not found"
+        if [ -d "$INSTALL_SOURCE/po" ]; then
+            cp -r "$INSTALL_SOURCE/po" "$TEMP_DIR/"
+        fi
     fi
 
     python3 -m py_compile "$TEMP_DIR/$EXT_FILE" \
@@ -144,6 +169,19 @@ install_files() {
     cp "$TEMP_DIR/$SCHEMA_FILE" "$USER_SCHEMA_DIR/$SCHEMA_FILE"
     line "Preferences installed" "$USER_SCHEMA_DIR/$SCHEMA_FILE"
     glib-compile-schemas "$USER_SCHEMA_DIR"
+
+    # Compile and install gettext translations
+    if [ -d "$TEMP_DIR/po" ] && command -v msgfmt >/dev/null 2>&1; then
+        for po_file in "$TEMP_DIR"/po/*.po; do
+            if [ -f "$po_file" ]; then
+                lang=$(basename "$po_file" .po)
+                loc_dir="$HOME/.local/share/locale/$lang/LC_MESSAGES"
+                mkdir -p "$loc_dir"
+                msgfmt "$po_file" -o "$loc_dir/nautilus-my-computer.mo"
+                line "Translation ($lang) installed" "$loc_dir/nautilus-my-computer.mo"
+            fi
+        done
+    fi
 }
 
 # ─── Restart Nautilus ─────────────────────────────────────────────────────────
@@ -154,7 +192,11 @@ offer_restart() {
     if [[ "$answer" =~ ^[Yy]$ ]]; then
         nautilus -q >/dev/null 2>&1 || true
         sleep 1
-        (exec >/dev/null 2>&1 </dev/null; exec nautilus) &
+        if command -v gtk-launch >/dev/null 2>&1; then
+            gtk-launch org.gnome.Nautilus >/dev/null 2>&1 &
+        else
+            (exec >/dev/null 2>&1 </dev/null; exec nautilus) &
+        fi
         disown $!
     fi
 }
@@ -183,6 +225,7 @@ do_install() {
     echo ""
     detect_pm
     ensure_nautilus_python
+    ensure_gettext
     download_files
     install_files
 
@@ -210,6 +253,18 @@ do_uninstall() {
         glib-compile-schemas "$USER_SCHEMA_DIR"
         line "Preferences removed" "$USER_SCHEMA_DIR/$SCHEMA_FILE"
         found=true
+    fi
+
+    # Remove compiled translations
+    local loc_dir_prefix="$HOME/.local/share/locale"
+    if [ -d "$loc_dir_prefix" ]; then
+        for mo_file in "$loc_dir_prefix"/*/LC_MESSAGES/nautilus-my-computer.mo; do
+            if [ -f "$mo_file" ]; then
+                rm -f "$mo_file"
+                line "Translation removed" "$mo_file"
+                found=true
+            fi
+        done
     fi
 
     if [ "$found" = false ]; then
