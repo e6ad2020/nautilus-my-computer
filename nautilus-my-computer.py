@@ -13,7 +13,31 @@ gi.require_version("GObject", "2.0")
 gi.require_version("Gtk", "4.0")
 from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Nautilus
 
-_ = gettext.translation("nautilus", fallback=True).gettext
+# Initialize gettext translations
+_custom_translation = None
+_localedir = os.path.expanduser("~/.local/share/locale")
+try:
+    _custom_translation = gettext.translation("nautilus-my-computer", localedir=_localedir)
+except Exception:
+    pass
+
+_nautilus_translation = None
+try:
+    _nautilus_translation = gettext.translation("nautilus")
+except Exception:
+    pass
+
+def _(text: str) -> str:
+    # Try custom domain first
+    if _custom_translation is not None:
+        val = _custom_translation.gettext(text)
+        if val != text:
+            return val
+    # Fallback to Nautilus domain
+    if _nautilus_translation is not None:
+        return _nautilus_translation.gettext(text)
+    # Default fallback to the string itself
+    return text
 
 DEBUG_LOG = True
 DEBUG_LOG_PREFIX = "MyComputer"  # prefix for all debug lines, to make them easy to filter in logs
@@ -28,6 +52,7 @@ EXT_GITHUB      = "https://github.com/yannmasoch/nautilus-my-computer"
 
 DISKS_URI       = "computer:///"
 BOOKMARK_LABEL  = "Computer"
+BOOKMARK_LABEL_LOCAL = _(BOOKMARK_LABEL)
 BOOKMARKS_FILE  = os.path.expanduser("~/.config/gtk-3.0/bookmarks")
 COMPUTER_ICON   = "computer-symbolic"  # icon used in sidebar and path bar
 MENU_ITEM_LABEL = "My Computer Settings"   # label in Nautilus hamburger menu
@@ -68,7 +93,7 @@ try:
     )
     _LOCATION_TITLE = _info.get_display_name()
 except Exception:
-    _LOCATION_TITLE = BOOKMARK_LABEL
+    _LOCATION_TITLE = BOOKMARK_LABEL_LOCAL
 
 # Localized title Nautilus shows when browsing the user's home folder.
 # Used to distinguish a "default new window" (opened at Home) from a window
@@ -179,7 +204,7 @@ def _log(msg: str) -> None:
         print(f"{DEBUG_LOG_PREFIX}: {msg}", flush=True)
 
 
-_log(f"Configured URI title: '{_LOCATION_TITLE}' (Bookmark: '{BOOKMARK_LABEL}')")
+_log(f"Configured URI title: '{_LOCATION_TITLE}' (Bookmark: '{BOOKMARK_LABEL}', Local: '{BOOKMARK_LABEL_LOCAL}')")
 
 
 def _get_gsettings() -> Gio.Settings | None:
@@ -430,7 +455,7 @@ def _refresh(mounts: list[dict]) -> bool:
 
 
 def _ensure_bookmark() -> None:
-    entry = f"{DISKS_URI} {BOOKMARK_LABEL}"
+    entry = f"{DISKS_URI} {BOOKMARK_LABEL_LOCAL}"
     os.makedirs(os.path.dirname(BOOKMARKS_FILE), exist_ok=True)
     lines: list[str] = []
     if os.path.exists(BOOKMARKS_FILE):
@@ -1195,7 +1220,7 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
                 by_group[gkey] = items
 
 
-        group_labels = {key: lbl for key, lbl in _GROUPS}
+        group_labels = {key: _(lbl) for key, lbl in _GROUPS}
         size_group = Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL)
 
         for group_key, _group_label in _GROUPS:
@@ -1299,7 +1324,10 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
             st = self._windows.get(win)
             if st is not None and v > 0:
                 st.setdefault("bar_geom", {})[bname] = v
-            sub_text = f"{_format_size(m['free'])} free of {_format_size(m['total'])}"
+            sub_text = _("{free} free of {total}").format(
+                free=_format_size(m['free']),
+                total=_format_size(m['total'])
+            )
         else:
             bar.set_visible(False)
             sub_text = nav_uri
@@ -1737,7 +1765,7 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
 
         mode_row = Adw.ComboRow()
         mode_row.set_title(_("Color mode"))
-        mode_model = Gtk.StringList.new(["System accent", "Custom color", "Gradient"])
+        mode_model = Gtk.StringList.new([_( "System accent"), _("Custom color"), _("Gradient")])
         mode_row.set_model(mode_model)
         _mode_map = ["accent", "flat", "gradient"]
         current_mode = self._gsettings.get_string("color-mode")
@@ -1947,6 +1975,7 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
             site="_fix_sidebar_icon",
         )
 
+        target_labels = {BOOKMARK_LABEL, BOOKMARK_LABEL_LOCAL, _LOCATION_TITLE}
         found = False
         if nav_box is not None:
             # Direct children of nav_box are the sidebar rows — no class name needed.
@@ -1956,7 +1985,7 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
                     ((w.get_label() or "").strip() for w in _all_widgets(row) if isinstance(w, Gtk.Label)),
                     None,
                 )
-                if label_text == BOOKMARK_LABEL:
+                if label_text in target_labels:
                     for w in _all_widgets(row):
                         if isinstance(w, Gtk.Image):
                             _pin_icon(w, COMPUTER_ICON)
@@ -1972,7 +2001,7 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
                     ((w.get_label() or "").strip() for w in _all_widgets(row) if isinstance(w, Gtk.Label)),
                     None,
                 )
-                if label_text == BOOKMARK_LABEL:
+                if label_text in target_labels:
                     for w in _all_widgets(row):
                         if isinstance(w, Gtk.Image):
                             _pin_icon(w, COMPUTER_ICON)
@@ -2040,7 +2069,7 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
 
     def _subscribe_pathbar_labels(self, pathbar) -> None:
         """Connect notify::label on every GtkLabel inside *pathbar*."""
-        target_labels = {BOOKMARK_LABEL, _LOCATION_TITLE}
+        target_labels = {BOOKMARK_LABEL, BOOKMARK_LABEL_LOCAL, _LOCATION_TITLE}
         for w in _all_widgets(pathbar):
             if isinstance(w, Gtk.Label) and not getattr(w, "_diskinfo_label_watched", False):
                 w._diskinfo_label_watched = True
@@ -2058,7 +2087,7 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
         if pathbar_or_win is None:
             return False
 
-        target_labels = {BOOKMARK_LABEL, _LOCATION_TITLE}
+        target_labels = {BOOKMARK_LABEL, BOOKMARK_LABEL_LOCAL, _LOCATION_TITLE}
         for w in _all_widgets(pathbar_or_win):
             if not isinstance(w, Gtk.Label):
                 continue
