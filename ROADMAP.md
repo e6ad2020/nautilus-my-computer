@@ -13,15 +13,19 @@ This roadmap reflects planned fixes, features, and improvements. It is subject t
 
 ## v0.2.1 — Bug fixes
 - fix: disk cards not updating when drives are connected or disconnected
-- fix: level bar length regression -> longer
 - fix: installer does not abort on missing release (credit @sour-source)
 - fix: missing icon for mounted ISO images (credit @sour-source)
 
 ## v0.2.2 — Bookmark naming
 - feat: bookmark Computer name not follow the active language
+- feat: adding Italian, Spanish and Portuguese translations 
 
 ## v0.2.3 - Disk cards bug fixes
 - fix: disk cards not always updating when file transfers
+
+## v0.2.4 - UX
+- UX: reduce space betwen group label and cards
+- UX: better linear template for list view
 
 ## Upcoming
 Contributions, suggestions or languages welcome via Issues.
