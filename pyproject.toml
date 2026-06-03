@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nautilus-my-computer"
-version = "0.2.0"
+version = "0.2.1"
 description = "My Computer for Nautilus, a GNOME file manager extension"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -42,6 +42,9 @@ line-length = 100
 [tool.ruff.lint]
 select = ["E", "F", "W", "I"]
 # E/W = pycodestyle, F = pyflakes, I = isort
+ignore = [
+    "E402",  # gi.require_version() must precede gi.repository imports — required pattern
+]
 
 [tool.ruff.format]
 quote-style = "double"
