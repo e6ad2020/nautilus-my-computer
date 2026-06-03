@@ -1029,10 +1029,24 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
 
             # Initial attempt to fix icons. If they aren't ready yet,
             # _on_title_changed will retry when navigation happens.
-            self._fix_sidebar_icon(win)
-            self._attach_pathbar(win)
-            self._inject_main_menu(win)
-            self._on_title_changed(win, None)
+            #
+            # Defer all post-inject work to an idle callback. _inject_stack()
+            # has just reparented the ToolbarView content into our GtkStack;
+            # GTK has not yet finished processing the widget-tree change.
+            # Any operation that triggers GObject signals (menu insertion,
+            # stack child switching, property notifications) can cascade
+            # through GtkPopoverMenuBar / NautilusWindowSlot into
+            # gtk_stack_get_page() on the internal stack — which is no
+            # longer in the expected position after reparenting.  Deferring
+            # to idle lets GTK settle the tree first, avoiding the
+            # GTK_IS_STACK assertion and the resulting SIGSEGV.
+            def _deferred_init(w=win):
+                self._fix_sidebar_icon(w)
+                self._attach_pathbar(w)
+                self._inject_main_menu(w)
+                self._on_title_changed(w, None)
+                return False  # one-shot
+            GLib.idle_add(_deferred_init)
             return True
         return False
 
@@ -1105,14 +1119,19 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
         elif mode == "gradient":
             c1 = self._gsettings.get_string("gradient-color-1")
             c2 = self._gsettings.get_string("gradient-color-2")
+            # Detect RTL to mirror gradient and background position
+            is_rtl = Gtk.get_locale_direction() == Gtk.TextDirection.RTL
+            grad_dir = "to left" if is_rtl else "to right"
+            bg_pos = "right center" if is_rtl else "left center"
+            
             # Gradient on block.filled, sized to the full trough width via background-size.
             # For fill ratio v, background-size=(100/v)% makes the gradient span 100% of
             # background-size:(100/v)% scales the gradient to the full trough width.
-            # block.filled (width=v×trough) acts as a reveal window anchored at left.
+            # block.filled (width=v×trough) acts as a reveal window anchored at left (or right in RTL).
             rules = [
                 f".diskinfo-bar block.filled {{"
-                f" background-image: linear-gradient(to right, {c1} 20%, {c2} 100%);"
-                f" background-position: left center; background-repeat: no-repeat; }}"
+                f" background-image: linear-gradient({grad_dir}, {c1} 20%, {c2} 100%);"
+                f" background-position: {bg_pos}; background-repeat: no-repeat; }}"
             ]
             for st in self._windows.values():
                 for bname, v in st.get("bar_geom", {}).items():
