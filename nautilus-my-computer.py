@@ -2698,6 +2698,56 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
             lambda _lb, _row: self._navigate_to(DISKS_URI, win),
         )
 
+        def _on_computer_right_clicked(gesture, _n, x, y):
+            gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+
+            on_computer = self._windows.get(win, {}).get("visible_child") == STACK_DISKINFO
+
+            menu = Gio.Menu()
+            ag = Gio.SimpleActionGroup()
+
+            primary = Gio.Menu()
+            primary.append(_("Open"), "comprow.open")
+            primary.append(_("Open in New Tab"), "comprow.open-tab")
+            primary.append(_("Open in New Window"), "comprow.open-window")
+            menu.append_section(None, primary)
+
+            settings_section = Gio.Menu()
+            settings_section.append(_("My Computer Settings"), "comprow.settings")
+            menu.append_section(None, settings_section)
+
+            open_act = Gio.SimpleAction.new("open", None)
+            open_act.set_enabled(not on_computer)
+            open_act.connect("activate", lambda *_: self._do_open(DISKS_URI, win))
+            ag.add_action(open_act)
+
+            tab_act = Gio.SimpleAction.new("open-tab", None)
+            tab_act.connect("activate", lambda *_: self._do_open_tab(DISKS_URI, win))
+            ag.add_action(tab_act)
+
+            win_act = Gio.SimpleAction.new("open-window", None)
+            win_act.connect("activate", lambda *_: self._do_open_window(DISKS_URI))
+            ag.add_action(win_act)
+
+            settings_act = Gio.SimpleAction.new("settings", None)
+            settings_act.connect("activate", lambda *_: self._launch_prefs(win))
+            ag.add_action(settings_act)
+
+            list_row.insert_action_group("comprow", ag)
+
+            popover = Gtk.PopoverMenu.new_from_model(menu)
+            popover.set_has_arrow(False)
+            popover.set_parent(list_row)
+            rect = Gdk.Rectangle()
+            rect.x, rect.y, rect.width, rect.height = int(x), int(y), 1, 1
+            popover.set_pointing_to(rect)
+            popover.popup()
+
+        right_click = Gtk.GestureClick()
+        right_click.set_button(3)
+        right_click.connect("pressed", _on_computer_right_clicked)
+        our_listbox.add_controller(right_click)
+
         # Hide the eject button — not applicable for the Computer entry.
         btn = _find_widget(list_row, buildable_id="eject_button")
         if isinstance(btn, Gtk.Button):
