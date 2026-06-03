@@ -40,7 +40,7 @@ def _(text: str) -> str:
     return text
 
 
-DEBUG_LOG = os.environ.get("NAUTILUS_MY_COMPUTER_DEBUG", "").lower() in ("1", "true", "yes")
+DEBUG_LOG = os.environ.get("DEBUG", "").lower() in ("1", "true", "yes")
 DEBUG_LOG_PREFIX = "MyComputer"  # prefix for all debug lines, to make them easy to filter in logs
 
 # ── Extension metadata (keep in sync with pyproject.toml) ────────────────────
