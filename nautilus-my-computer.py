@@ -1795,6 +1795,10 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
                 GLib.idle_add(
                     lambda: [f.unselect_all() for f in state.get("section_flows", [])] and False
                 )
+                sidebar_lb = state.get("sidebar_listbox")
+                sidebar_row = state.get("sidebar_row")
+                if sidebar_lb and sidebar_row:
+                    GLib.idle_add(lambda lb=sidebar_lb, r=sidebar_row: lb.select_row(r) or False)
 
             # Re-pin the chrome icons (path-bar chip + sidebar row) every time we
             # arrive at the computer view. This must run even when the stack is
@@ -1815,6 +1819,9 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
                     flow.unselect_all()
                 state["_deselecting"] = False
                 state["selected_key"] = None
+            sidebar_lb = state.get("sidebar_listbox")
+            if sidebar_lb:
+                GLib.idle_add(lambda lb=sidebar_lb: lb.unselect_all() or False)
             if not self._set_stack_visible_child(state, STACK_FILES, "title changed show files"):
                 return
             self._stop_usage_poll_if_idle()
@@ -2483,6 +2490,11 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
                 lambda _lb, row: our_listbox.unselect_all() if row else None,
             )
             _log("_inject_sidebar_link: cross-deselect wired ✓")
+
+        state = self._windows.get(win)
+        if state is not None:
+            state["sidebar_listbox"] = our_listbox
+            state["sidebar_row"] = list_row
 
         _log("_inject_sidebar_link: outer scroll wrapper set as content ✓")
         return True
