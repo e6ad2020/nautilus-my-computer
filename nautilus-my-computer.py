@@ -72,6 +72,7 @@ DBUS_PATH_FILE_MANAGER = "/org/freedesktop/FileManager1"
 # below are one-shot retry/debounce intervals, not continuous poll periods.
 _REFRESH_DEBOUNCE_MS = 300  # coalesce rapid mount/unmount/plug events
 _WIN_INIT_RETRY_MS = 20  # retry interval while waiting for NautilusWindow widget tree
+_WIN_INIT_MAX_ATTEMPTS = 100  # ~2 s budget waiting for the first view load to settle
 _NAV_RETRY_MS = 60  # retry interval while navigating to computer:///
 _TAB_WAIT_MS = 50  # retry interval while waiting for a new tab slot
 _USAGE_GATE_MS = 1000  # idle cadence: try a statvfs sweep this often, skip while disk is busy
@@ -915,7 +916,23 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
         return False
 
     def _on_window_added(self, _app, win: Gtk.Window) -> None:
-        """Instant handler for new Nautilus windows — retries until widget tree is ready."""
+        """Instant handler for new Nautilus windows — defers injection until load settles."""
+        self._schedule_window_init(win)
+
+    def _schedule_window_init(self, win: Gtk.Window) -> None:
+        """Wait for the window's first view load to settle, then inject on a
+        low-priority idle.
+
+        Injecting our Gtk.Stack reparents the AdwToolbarView content. Doing that
+        during Nautilus's files_view_begin_loading races with its templates
+        context-menu rebuild: with a non-empty ~/Templates,
+        slot_on_templates_menu_changed rebuilds a GtkPopoverMenu whose internal
+        GtkStack our tree surgery destabilises, hitting a Nautilus-core
+        use-after-free that segfaults on GTK 4.22 / GNOME 50 (GTK_IS_STACK
+        assertion → SIGSEGV). Deferring until the load has finished, and running
+        the injection at PRIORITY_LOW (after Nautilus's loading idles drain),
+        removes the overlap. See issue #4. Empty ~/Templates never triggers it.
+        """
         if not _is_nautilus_window(win) or win in self._windows:
             return
         attempts = [0]
@@ -923,14 +940,26 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
         def _try() -> bool:
             if win in self._windows:
                 return GLib.SOURCE_REMOVE
-            if self._init_window(win):
-                return GLib.SOURCE_REMOVE
             attempts[0] += 1
-            if attempts[0] > 25:  # ~500 ms budget
-                return GLib.SOURCE_REMOVE
-            return GLib.SOURCE_CONTINUE
+            # Hold off until the widget tree exists AND the first load has
+            # settled (title resolved to a real location, not "Loading…").
+            if _is_unsettled_title(win.get_title() or ""):
+                if attempts[0] > _WIN_INIT_MAX_ATTEMPTS:
+                    # Window never settled (rare) — inject anyway so the
+                    # extension still works; route through the low-prio idle.
+                    GLib.idle_add(self._deferred_init_window, win, priority=GLib.PRIORITY_LOW)
+                    return GLib.SOURCE_REMOVE
+                return GLib.SOURCE_CONTINUE
+            GLib.idle_add(self._deferred_init_window, win, priority=GLib.PRIORITY_LOW)
+            return GLib.SOURCE_REMOVE
 
         GLib.timeout_add(_WIN_INIT_RETRY_MS, _try)
+
+    def _deferred_init_window(self, win: Gtk.Window) -> bool:
+        """Low-priority idle wrapper around _init_window (always one-shot)."""
+        if win not in self._windows and _is_nautilus_window(win):
+            self._init_window(win)
+        return GLib.SOURCE_REMOVE
 
     def _init_window(self, win: Gtk.Window) -> bool:
         css = Gtk.CssProvider()
@@ -960,7 +989,9 @@ class MyComputerExtension(GObject.GObject, Nautilus.MenuProvider):
         for win in toplevels:
             if _is_nautilus_window(win) and win not in self._windows:
                 found_any = True
-                self._init_window(win)
+                # Route through the deferred path: a window present at
+                # extension-load time may still be mid-load (see issue #4).
+                self._schedule_window_init(win)
         if toplevels and not found_any and not self._windows:
             names = [type(w).__name__ for w in toplevels]
             _log(f"check_new_windows: no NautilusWindow found among {names} — class renamed?")
