@@ -33,6 +33,7 @@ This roadmap reflects planned fixes, features, and improvements. It is subject t
 ## v0.3.3 — UX
 - UX: reduce space between group label and cards
 - UX: improve linear template for list view
+- UX: adjust top margin of Computer button
 
 ## Upcoming
 Contributions, suggestions or languages welcome via Issues.
